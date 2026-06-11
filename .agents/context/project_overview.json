@@ -1,0 +1,53 @@
+{
+  "scout": {
+    "project_name": "coding_agent",
+    "tech_stack": [
+      "python",
+      "3.11+",
+      "mofox-plugin-system",
+      "asyncio",
+      "websockets",
+      "llm"
+    ],
+    "source_root": ".",
+    "modules": [
+      {
+        "path": "agents",
+        "description": "子代理组件：ProjectScout（项目侦察）、ModuleResearcher（模块研究）、Coder（编码执行）、AutoReviewer（自动审查）",
+        "estimated_files": 5
+      },
+      {
+        "path": "services",
+        "description": "服务组件：ProjectContext（项目上下文）、GitIgnoreScope（忽略规则）、TerminalEnvironment（终端环境）、ToolLoopGuard（工具循环防护）",
+        "estimated_files": 5
+      },
+      {
+        "path": "tools",
+        "description": "工具组件：Bash/Read/Write/Edit/Grep/Find/Ls/CreatePlan/ImplementPlan 等工具",
+        "estimated_files": 11
+      },
+      {
+        "path": ".",
+        "description": "根级模块：Chatter（主编排器）、Adapter（WebSocket适配器）、Config（配置）、Orchestration（子代理编排）、Session管理、Checkpoint管理、Permission管理、MCP集成、Prompts提示词模板",
+        "estimated_files": 13
+      }
+    ],
+    "config_files": [
+      "manifest.json"
+    ],
+    "test_directory": null,
+    "build_system": "mofox-plugin",
+    "virtual_environment": "未检测到",
+    "key_files": [
+      "manifest.json",
+      "plugin.py",
+      "__init__.py",
+      "config.py",
+      "chatter.py",
+      "adapter.py",
+      "orchestration.py",
+      "prompts.py"
+    ]
+  },
+  "virtual_environment": "未检测到"
+}

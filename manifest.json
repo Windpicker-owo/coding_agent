@@ -1,0 +1,39 @@
+{
+    "name": "coding_agent",
+    "display_name": "Coding Agent",
+    "version": "0.1.1",
+    "description": "类 Claude Code 的编程智能体，前后端分离架构",
+    "author": "MoFox Team",
+    "dependencies": {
+        "plugins": [],
+        "components": []
+    },
+    "categories": [
+        "chat"
+    ],
+    "tags": [
+        "coding",
+        "agent",
+        "tool-use",
+        "project-management"
+    ],
+    "include": [
+        {"component_type": "config", "component_name": "coding_agent_config", "dependencies": []},
+        {"component_type": "chatter", "component_name": "coding_agent", "dependencies": []},
+        {"component_type": "adapter", "component_name": "coding_agent_adapter", "dependencies": []},
+        {"component_type": "service", "component_name": "project_context", "dependencies": []},
+        {"component_type": "tool", "component_name": "bash", "dependencies": []},
+        {"component_type": "tool", "component_name": "read", "dependencies": []},
+        {"component_type": "tool", "component_name": "write", "dependencies": []},
+        {"component_type": "tool", "component_name": "edit", "dependencies": []},
+        {"component_type": "tool", "component_name": "grep", "dependencies": []},
+        {"component_type": "tool", "component_name": "find", "dependencies": []},
+        {"component_type": "tool", "component_name": "ls", "dependencies": []},
+        {"component_type": "agent", "component_name": "project_scout", "dependencies": []},
+        {"component_type": "agent", "component_name": "module_researcher", "dependencies": []},
+        {"component_type": "agent", "component_name": "coder", "dependencies": []},
+        {"component_type": "agent", "component_name": "auto_reviewer", "dependencies": []}
+    ],
+    "entry_point": "plugin.py",
+    "min_core_version": "1.2.0-rc"
+}
