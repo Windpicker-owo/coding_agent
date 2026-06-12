@@ -18,14 +18,14 @@ from mofox_wire import (
     MessageEnvelope,
     WebSocketAdapterOptions,
 )
-from websockets.legacy import server as ws_server
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.asyncio.server import serve as ws_serve
 
 from src.app.plugin_system.base import BaseAdapter, BasePlugin
 from src.app.plugin_system.api import service_api
 from src.kernel.logger import get_logger
 
 from .session_manager import get_session_manager
-from .services.project_context import ProjectContextService
 
 logger = get_logger("coding_agent.adapter")
 
@@ -121,15 +121,20 @@ class CodingAgentAdapter(BaseAdapter):
         path = parsed.path or "/coding-agent/ws"
 
         async def handler(ws: Any) -> None:
-            if ws.path != path:
+            # 新版 websockets.asyncio.server: path 通过 ws.request.path 访问
+            ws_path = getattr(getattr(ws, "request", None), "path", None) or getattr(ws, "path", "/")
+            if ws_path != path:
                 await ws.close(code=4000, reason="Path mismatch")
                 return
             await self._handle_connection(ws)
 
-        self._ws_server = await ws_server.serve(
+        self._ws_server = await ws_serve(
             handler,
             host,
             port,
+            ping_interval=None,       # 禁用服务端 keepalive ping，客户端负责
+            ping_timeout=None,
+            close_timeout=5,          # 加速关闭，减少 _drain_helper 竞态窗口
             max_size=options.max_message_size,
         )
         logger.info(f"Coding Agent WS 服务器启动: ws://{host}:{port}{path}")
@@ -145,14 +150,22 @@ class CodingAgentAdapter(BaseAdapter):
                     await self._handle_raw_with_conn(payload, conn_id)
                 except Exception:
                     logger.error("处理 TUI 消息异常")
+        except ConnectionClosedOK:
+            logger.info(f"TUI 连接 {conn_id[:8]} 正常关闭")
+        except ConnectionClosedError as e:
+            logger.warning(f"TUI 连接 {conn_id[:8]} 异常关闭 (code={e.code})")
         except Exception:
             logger.error(f"TUI 连接 {conn_id[:8]} 异常断开")
         finally:
             self._connections.pop(conn_id, None)
             session_id = self._conn_sessions.pop(conn_id, None)
             if session_id:
+                # 在 destroy 前断开 websocket 引用，防止 broadcast_to_session 尝试向已关闭的连接发送
                 self._session_ws.pop(session_id, None)
                 session_mgr = get_session_manager()
+                session = session_mgr.get_session(session_id)
+                if session:
+                    session.websocket = None
                 await session_mgr.destroy_session(session_id)
             logger.info(f"TUI 连接 {conn_id[:8]} 已关闭")
 
@@ -175,7 +188,7 @@ class CodingAgentAdapter(BaseAdapter):
 
             if session_id:
                 # 恢复模式
-                session = await session_mgr.resume_session(
+                session, resume_warning = await session_mgr.resume_session(
                     conn_id=conn_id,
                     working_directory=working_directory,
                     session_id=session_id,
@@ -186,12 +199,14 @@ class CodingAgentAdapter(BaseAdapter):
                         conn_id=conn_id,
                         working_directory=working_directory,
                     )
+                    resume_warning = ""
             else:
                 # 新建模式
                 session = await session_mgr.create_session(
                     conn_id=conn_id,
                     working_directory=working_directory,
                 )
+                resume_warning = ""
 
             self._conn_sessions[conn_id] = session.id
             self._session_ws[session.id] = self._connections[conn_id]
@@ -207,7 +222,7 @@ class CodingAgentAdapter(BaseAdapter):
                 "title": session._title or "",
             }
 
-            # 如果是恢复模式，添加历史消息
+            # 如果是恢复模式，添加历史消息和目录不匹配警告
             if session_id and session._resume_payloads is not None:
                 history = []
                 for pdata in session._resume_payloads:
@@ -228,6 +243,10 @@ class CodingAgentAdapter(BaseAdapter):
                         })
                 
                 ready_payload["history"] = history
+
+            # 如果有 working_directory 不匹配警告，加入 payload
+            if resume_warning:
+                ready_payload["working_directory_mismatch"] = resume_warning
 
             await session_mgr.broadcast_to_session(session.id, {
                 "type": "session.ready",
@@ -298,11 +317,33 @@ class CodingAgentAdapter(BaseAdapter):
         elif msg_type == "user.interrupt":
             await session_mgr.broadcast_to_session(session_id, {
                 "type": "agent.status",
-                "payload": {"phase": "ready", "detail": "操作已中断"},
+                "payload": {"phase": "ready", "detail": "操作已中断", "source": "agent"},
             })
 
         elif msg_type == "auto_review.toggle":
             session.auto_review_enabled = raw.get("payload", {}).get("enabled", False)
+
+        elif msg_type == "yolo.toggle":
+            session.yolo_mode = raw.get("payload", {}).get("enabled", False)
+
+        elif msg_type == "goal.set":
+            session.goal_mode = True
+            session.goal_text = raw.get("payload", {}).get("text", "")
+            # 将目标作为 user message 注入管线
+            content = (
+                f"你已进入目标模式，用户已经离线，你需要自主完成以下目标：\n\n"
+                f"{session.goal_text}\n\n"
+                f"请立即开始分析目标并制定实施计划。"
+            )
+            envelope = await self._build_user_envelope(
+                {"payload": {"content": content, "kind": "message"}},
+                session_id=session.id,
+            )
+            if envelope:
+                from src.core.transport.message_receive.utils import extract_stream_id
+                stream_id = extract_stream_id(envelope["message_info"])
+                session_mgr.bind_stream_id(session_id=session.id, stream_id=stream_id)
+                await self.core_sink.send(envelope)
 
         elif msg_type == "checkpoint.rollback":
             await self._handle_rollback(session, raw.get("payload", {}))
@@ -312,6 +353,14 @@ class CodingAgentAdapter(BaseAdapter):
 
         elif msg_type == "session.link":
             await self._handle_link(session, raw.get("payload", {}))
+
+        elif msg_type == "session.close":
+            # 前端主动关闭会话：清理连接映射和内存会话，保留磁盘数据
+            self._conn_sessions.pop(conn_id, None)
+            self._session_ws.pop(session_id, None)
+            session.websocket = None
+            await session_mgr.destroy_session(session_id)
+            logger.debug(f"会话 {session_id[:8]} 已由前端主动关闭")
 
     # ── 消息转换 ─────────────────────────────────────────
 
@@ -400,7 +449,6 @@ class CodingAgentAdapter(BaseAdapter):
 
     async def _handle_link(self, session: Any, payload: dict) -> None:
         """处理 session.link 消息，关联外部项目目录。"""
-        import os
         from pathlib import Path
         
         session_mgr = get_session_manager()
@@ -583,7 +631,15 @@ class CodingAgentAdapter(BaseAdapter):
             name="linked_projects",
             content=reminder_content,
             insert_type="dynamic",
-            consume="once",
+            consume="forever",
+        )
+        # 同时注入 Coder 的独立槽位，Coder 通过 with_reminder="code_coder" 自动获取
+        add_system_reminder(
+            bucket="code_coder",
+            name="linked_projects",
+            content=reminder_content,
+            insert_type="dynamic",
+            consume="forever",
         )
         
         # 7. 构建 user envelope 并注入对话

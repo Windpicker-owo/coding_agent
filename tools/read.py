@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import aiofiles
-from pathlib import Path
 from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool

@@ -12,7 +12,7 @@ from src.app.plugin_system.base import (
 from src.app.plugin_system.types import ChatType
 
 from src.app.plugin_system.api.prompt_api import add_system_reminder
-from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, ToolRegistry
+from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, ToolResult, ToolRegistry
 from src.kernel.logger import get_logger, COLOR
 
 from .config import CodingAgentConfig
@@ -49,6 +49,10 @@ class CodingAgentChatter(BaseChatter):
         self._current_request: Any = None  # 当前 LLMRequest/LLMResponse，用于自动保存
         self._is_first_message: bool = True  # 是否首条用户消息（用于标题生成）
         self._message_count: int = 0  # 已处理的消息数
+        self._goal_review_pending: bool = False
+        self._last_trigger_msgs: list = []  # 最近一次有效触发消息，goal 审查时 fallback
+        self._is_goal_review_round: bool = False  # 当前轮次是否为 goal 审查轮
+        self._goal_round_modified: bool = False  # goal 审查本轮是否使用了修改性工具
 
     async def execute(self) -> AsyncGenerator[
         Wait | Success | Failure | Stop,
@@ -147,22 +151,73 @@ class CodingAgentChatter(BaseChatter):
         session_mgr = get_session_manager()
 
         while True:
-            unreads_text, unreads = await self.fetch_unreads()
+            # ── Goal 模式自动审查 ──
+            session = session_mgr.get_session(session_id)
+            if session and session.goal_mode and self._goal_review_pending:
+                # 先检查用户是否有新消息（中断审查循环）
+                unreads_text, unreads = await self.fetch_unreads()
+                if unreads:
+                    self._goal_review_pending = False
+                    await self.flush_unreads(unreads)
+                    current.add_payload(LLMPayload(ROLE.USER, Text(unreads_text)))
+                    self._is_first_message = False
+                    self._message_count += 1
+                    is_first = False
+                    await self._notify_status("thinking", "正在分析...")
+                else:
+                    self._goal_review_pending = False
+                    self._is_goal_review_round = True
+                    self._goal_round_modified = False  # 重置本轮修改标记
 
-            if not unreads:
-                resume = yield Wait()
-                continue
+                    # 构建全新的干净上下文，不受前面对话影响
+                    current = self.create_request(
+                        task="coding_main",
+                        request_name="coding_goal_review",
+                        with_reminder="code_main_agent",
+                    )
+                    current.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt())))
+                    current.add_payload(LLMPayload(ROLE.USER, Text(
+                        self._build_goal_review_prompt(session.goal_text)
+                    )))
 
-            await self.flush_unreads(unreads)
+                    # 注册工具
+                    registry = ToolRegistry()
+                    for tool_cls in [
+                        BashTool, ReadTool, WriteTool, EditTool,
+                        CreatePlanTool, ImplementPlanTool,
+                    ]:
+                        registry.register(tool_cls)
+                    for tool_cls in get_mcp_tools_for_agent(self.plugin, "main"):
+                        registry.register(tool_cls)
+                    tool_schemas = registry.get_all()
+                    if tool_schemas:
+                        current.add_payload(LLMPayload(ROLE.TOOL, tool_schemas))  # type: ignore[arg-type]
 
-            # 记录是否为首条消息（用于标题生成）
-            is_first = self._is_first_message
-            self._is_first_message = False
-            self._message_count += 1
+                    self._is_first_message = False
+                    self._message_count += 1
+                    is_first = False
+                    await self._notify_status("thinking", "正在审查目标达成情况...")
+                # 跳过原有 fetch_unreads，直接进入 LLM 处理
+            else:
+                unreads_text, unreads = await self.fetch_unreads()
 
-            # 添加用户消息
-            current.add_payload(LLMPayload(ROLE.USER, Text(unreads_text)))
-            await self._notify_status("thinking", "正在分析...")
+                if not unreads:
+                    yield Wait()  # type: ignore[misc]
+                    continue
+
+                await self.flush_unreads(unreads)
+
+                # 保存触发消息，供 goal 审查时工具调用 fallback
+                self._last_trigger_msgs = unreads
+
+                # 记录是否为首条消息（用于标题生成）
+                is_first = self._is_first_message
+                self._is_first_message = False
+                self._message_count += 1
+
+                # 添加用户消息
+                current.add_payload(LLMPayload(ROLE.USER, Text(unreads_text)))
+                await self._notify_status("thinking", "正在分析...")
 
             # 发送请求
             try:
@@ -208,6 +263,9 @@ class CodingAgentChatter(BaseChatter):
                     f"tool_calls={len(current.call_list) if current.call_list else 0}, "
                     f"has_thinking={bool(current.reasoning_content)}"
                 )
+
+                # 推送上下文用量到前端
+                await self._push_context_usage(session_id, current)
             except Exception as e:
                 logger.error(f"LLM 调用失败: {e}", exc_info=True)
                 await self._notify_status("error", f"LLM 调用失败: {e}")
@@ -215,8 +273,9 @@ class CodingAgentChatter(BaseChatter):
                     "type": "agent.text",
                     "payload": {"content": current.message or "", "is_final": True},
                 })
-                # 恢复 current 指针
+                # 恢复 current 指针，重置 goal 审查状态
                 current = self._current_request
+                self._goal_review_pending = False
                 continue
 
             # 发送 thinking 内容（如有）
@@ -244,7 +303,9 @@ class CodingAgentChatter(BaseChatter):
                 # 有工具调用 → 处理工具调用（可能多轮）
                 try:
                     await self._notify_status("coding", "正在执行工具...")
-                    current = await self._handle_tool_calls(current, registry, unreads, session_id)
+                    # goal 审查时 unreads 可能为空，用上次有效消息作 fallback
+                    trigger_msgs = unreads if unreads else self._last_trigger_msgs
+                    current = await self._handle_tool_calls(current, registry, trigger_msgs, session_id)
                     if current:
                         if current.reasoning_content:
                             await self._stream_thinking_to_frontend(
@@ -266,19 +327,46 @@ class CodingAgentChatter(BaseChatter):
                         },
                     })
                     current = self._current_request
+                    self._goal_review_pending = False
                     continue
 
-            # 更新 current_request 指针
-            self._current_request = current
-
-            # 自动保存会话状态（fire-and-forget）
-            asyncio.create_task(self._auto_save(session_id))
+            # 更新 current_request 指针（goal 审查轮不更新，保持正常对话指针）
+            was_goal_review = self._is_goal_review_round
+            self._is_goal_review_round = False
+            if not was_goal_review:
+                self._current_request = current
+                # 自动保存会话状态（fire-and-forget）
+                asyncio.create_task(self._auto_save(session_id))
 
             # 首条消息后生成标题（fire-and-forget）
             if is_first:
                 asyncio.create_task(self._generate_title(session_id, unreads_text))
 
-            await self._notify_status("ready", "等待输入")
+            # ── Goal 模式完成检查 ──
+            session = session_mgr.get_session(session_id)
+            if session and session.goal_mode:
+                current_msg = (current.message or "").strip()
+                if "GOAL COMPLETE" in current_msg:
+                    # 强制检查：如果本轮使用了修改性工具，GOAL COMPLETE 无效
+                    if self._goal_round_modified:
+                        logger.debug("Goal 审查轮有修改操作，GOAL COMPLETE 无效，继续审查")
+                        self._goal_round_modified = False
+                        self._goal_review_pending = True
+                        continue
+                    session.goal_mode = False
+                    session.goal_text = ""
+                    await session_mgr.broadcast_to_session(session_id, {
+                        "type": "goal.complete", "payload": {},
+                    })
+                    await self._notify_status("ready", "目标已完成")
+                else:
+                    self._goal_review_pending = True
+                    # goal 审查轮不更新 current_request
+                    if not was_goal_review:
+                        self._current_request = current
+                    continue
+            else:
+                await self._notify_status("ready", "等待输入")
 
     # ── 自动保存 ───────────────────────────────────────────
 
@@ -355,7 +443,7 @@ class CodingAgentChatter(BaseChatter):
             prompt = (
                 "根据以下用户消息生成一个简洁的会话标题，不超过15个字。"
                 "只输出标题文本，不要加引号、标点或任何额外说明。\n\n"
-                f"用户消息：{user_message}"
+                "用户消息：" + user_message
             )
             title_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(prompt)))
             title_request.add_payload(LLMPayload(ROLE.USER, Text("请生成标题")))
@@ -437,10 +525,20 @@ class CodingAgentChatter(BaseChatter):
         # 只有当 project_context 有效时才设置 reminder
         if project_context and isinstance(project_context, dict):
             ctx_text = json.dumps(project_context, indent=2, ensure_ascii=False)
+            reminder_content = f"<project_context>\n{ctx_text}\n</project_context>"
+            # Main Agent 槽位
             add_system_reminder(
                 bucket="code_main_agent",
                 name="project_context",
-                content=f"<project_context>\n{ctx_text}\n</project_context>",
+                content=reminder_content,
+                insert_type="fixed",
+                consume="forever",
+            )
+            # Coder Agent 槽位，Coder 通过 with_reminder="code_coder" 自动获取
+            add_system_reminder(
+                bucket="code_coder",
+                name="project_context",
+                content=reminder_content,
                 insert_type="fixed",
                 consume="forever",
             )
@@ -449,6 +547,7 @@ class CodingAgentChatter(BaseChatter):
             from src.core.prompt import get_system_reminder_store
             store = get_system_reminder_store()
             store.delete(bucket="code_main_agent", name="project_context")
+            store.delete(bucket="code_coder", name="project_context")
             logger.warning("project_context 为空，已移除 system_reminder 注入")
 
         # 注入 skills 目录（如果存在）
@@ -459,6 +558,13 @@ class CodingAgentChatter(BaseChatter):
             if catalog:
                 add_system_reminder(
                     bucket="code_main_agent",
+                    name="skills",
+                    content=catalog,
+                    insert_type="fixed",
+                    consume="forever",
+                )
+                add_system_reminder(
+                    bucket="code_coder",
                     name="skills",
                     content=catalog,
                     insert_type="fixed",
@@ -519,7 +625,7 @@ class CodingAgentChatter(BaseChatter):
             cast(CodingAgentConfig | None, getattr(self.plugin, "config", None))
         )
 
-        return render_prompt(MAIN_AGENT_SYSTEM_PROMPT,
+        prompt = render_prompt(MAIN_AGENT_SYSTEM_PROMPT,
             terminal_environment=terminal_environment,
             nickname=nickname or "Coding Agent",
             alias_names=alias_names or nickname or "Coding Agent",
@@ -529,6 +635,29 @@ class CodingAgentChatter(BaseChatter):
             reply_style=reply_style or "保持专业、简洁、清晰",
             background_story=background_story or "",
         )
+
+        # 注入 Coder 模型 Profile 列表
+        coder_profiles_text = self._get_coder_profiles_text()
+        prompt = prompt.replace("[[coder_model_profiles]]", coder_profiles_text)
+
+        return prompt
+
+    def _get_coder_profiles_text(self) -> str:
+        """从插件配置读取 model_profiles 并生成 prompt 文本。
+
+        无 profiles 时返回空字符串（占位符被移除）。
+        """
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return ""
+
+        profiles: list = config.model_profiles
+        if not profiles:
+            return ""
+
+        from .services.model_router import ModelRouter
+        router = ModelRouter(profiles)
+        return router.describe_for_prompt()
 
     async def _handle_tool_calls(
         self, response: Any, registry: ToolRegistry,
@@ -554,6 +683,11 @@ class CodingAgentChatter(BaseChatter):
             # 通知前端即将执行的工具调用
             session_mgr = get_session_manager()
             for call in calls:
+                # goal 审查轮：检测修改性工具
+                if self._is_goal_review_round and call.name in (
+                    "write", "edit", "create_plan", "implement_plan",
+                ):
+                    self._goal_round_modified = True
                 await session_mgr.broadcast_to_session(session_id, {
                     "type": "tool.call",
                     "payload": {
@@ -592,21 +726,48 @@ class CodingAgentChatter(BaseChatter):
 
             # 从 response 继续发送（包含工具结果）
             await self._notify_status("thinking", "根据工具结果继续分析...")
-            response = await response.send(stream=True)
+            try:
+                response = await response.send(stream=True)
+            except Exception as e:
+                logger.error(f"LLM 流式请求失败 (round={round_num}): {e}")
+                # 保留已执行的工具结果，注入错误信息后退出工具循环
+                response.add_payload(LLMPayload(
+                    ROLE.TOOL_RESULT,
+                    ToolResult(
+                        value=f"LLM 请求失败: {e}。已执行的工具结果已保留，"
+                              f"请根据这些结果继续分析或重新尝试。",
+                        call_id="stream_error",
+                    ),
+                ))
+                break
 
             # 流式推送
             chunk_count = 0
             last_reasoning = ""
-            async for event in response.stream_events():
-                chunk = event.text_delta or ""
-                if chunk:
-                    chunk_count += 1
-                    await self._stream_to_frontend(session_id, chunk)
+            try:
+                async for event in response.stream_events():
+                    chunk = event.text_delta or ""
+                    if chunk:
+                        chunk_count += 1
+                        await self._stream_to_frontend(session_id, chunk)
 
-                reasoning = response.reasoning_content or ""
-                if reasoning and reasoning != last_reasoning:
-                    last_reasoning = reasoning
-                    await self._stream_thinking_to_frontend(session_id, reasoning)
+                    reasoning = response.reasoning_content or ""
+                    if reasoning and reasoning != last_reasoning:
+                        last_reasoning = reasoning
+                        await self._stream_thinking_to_frontend(session_id, reasoning)
+            except Exception as e:
+                logger.error(f"LLM 流式响应中断 (round={round_num}): {e}")
+                # 流中断但 response 可能已有部分内容，保留并退出
+                if not response.message:
+                    response.add_payload(LLMPayload(
+                        ROLE.TOOL_RESULT,
+                        ToolResult(
+                            value=f"流式响应中断: {e}。已执行的工具结果已保留，"
+                                  f"请根据这些结果继续。",
+                            call_id="stream_interrupt",
+                        ),
+                    ))
+                break
 
             # 发送后续轮次的 thinking 内容（如有）
             if response.reasoning_content:
@@ -664,14 +825,64 @@ class CodingAgentChatter(BaseChatter):
             # 外部取消，正常退出
             pass
 
+    async def _push_context_usage(self, session_id: str, current: Any) -> None:
+        """推送 LLM 上下文用量到前端。
+
+        从 current._usage 提取 total_tokens，从 current.model_set 提取 max_context。
+        如果 _usage 为 None（某些模型不返回），则不发送消息。
+        """
+        usage = getattr(current, "_usage", None)
+        if not usage:
+            return
+
+        total_tokens = usage.get("total_tokens", 0)
+        if not total_tokens:
+            return
+
+        # 从 model_set 获取 max_context（上下文窗口大小）
+        max_context = 0
+        model_set = getattr(current, "model_set", None)
+        if model_set and isinstance(model_set, list) and len(model_set) > 0:
+            max_context = model_set[0].get("max_context", 0) if isinstance(model_set[0], dict) else 0
+
+        await get_session_manager().broadcast_to_session(session_id, {
+            "type": "agent.context_usage",
+            "payload": {
+                "total_tokens": total_tokens,
+                "max_context": max_context,
+                "source": "agent",
+            },
+        })
+
     async def _notify_status(self, phase: str, detail: str) -> None:
         """推送 agent.status 消息到前端。"""
         session = get_session_manager().get_session_by_stream_id(self.stream_id)
         if session:
             await get_session_manager().broadcast_to_session(session.id, {
                 "type": "agent.status",
-                "payload": {"phase": phase, "detail": detail},
+                "payload": {"phase": phase, "detail": detail, "source": "agent"},
             })
+
+    @staticmethod
+    def _build_goal_review_prompt(goal_text: str) -> str:
+        """构建目标审查 prompt。"""
+        return (
+            "<system_reminder>\n"
+            "用户已经离线，你正在目标模式下工作。目标：" + goal_text + "\n\n"
+            "请完全不要依赖任何前文上下文和历史对话，"
+            "以全新的视角重新客观、严格地审视用户目标与当前实现的差距。"
+            "找出任何尚未满足目标要求之处，或可进一步优化的地方，并立即修改完善。\n\n"
+            "如果经过彻底审查后确实没有任何需要改动之处，"
+            "请仅输出 GOAL COMPLETE，不要输出任何其他内容。\n\n"
+            "重要规则：如果本轮你修改了任何文件、执行了任何代码变更，"
+            "则绝对不能输出 GOAL COMPLETE。必须先进入下一轮审查，"
+            "\n"
+            "警告：退出 goal 模式必须十分谨慎，这会导致迭代循环停止，可能导致交付质量不够。"
+            "因此在当你想要退出 goal 模式时，请务必首先思考有没有任何你没考虑到的可能性，"
+            "以及现在的实现是否已经无可挑剔了。\n"
+            "此消息将反复出现直到目标完成或者用户发送新的消息。"
+            "</system_reminder>"
+        )
 
     async def _stream_to_frontend(self, session_id: str, chunk: str) -> None:
         """推送 agent.text 流式 chunk 到前端。"""

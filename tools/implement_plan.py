@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import aiofiles
 from src.app.plugin_system.base import BaseTool
@@ -17,7 +16,10 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
     tool_name = "implement_plan"
     tool_description = (
         "Hand off a plan document to the Coder Agent for implementation. "
-        "Accepts either a plan_path (relative to .agents/context/) or inline plan_content."
+        "Accepts either a plan_path (relative to .agents/context/) or inline plan_content. "
+        "Optionally accepts extra_instruction to append additional constraints "
+        "(e.g. 'only complete steps 1-2'). "
+        "Optionally accepts model_profile to select a specific Coder model."
     )
     chatter_allow = ["coding_agent"]
 
@@ -25,8 +27,23 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
         self,
         plan_path: Annotated[str, "Path to the plan document created by create_plan"] = "",
         plan_content: Annotated[str, "Inline plan content (alternative to plan_path)"] = "",
+        model_profile: Annotated[
+            str,
+            "可选：指定 Coder 模型 Profile，如 claude-architect / gpt-backend / gemini-frontend",
+        ] = "",
+        extra_instruction: Annotated[
+            str,
+            "可选：追加的额外指令，如 '只完成第1-2步'、'跳过测试' 等，会附加到计划末尾",
+        ] = "",
     ) -> tuple[bool, str]:
-        """实施计划。"""
+        """实施计划。
+
+        Args:
+            plan_path: 计划文档路径
+            plan_content: 内联计划内容
+            model_profile: Coder 模型 Profile 名称，由 Main Agent 根据任务标签决策
+            extra_instruction: 追加到计划末尾的额外指令
+        """
         if not plan_path and not plan_content:
             return False, "必须提供 plan_path 或 plan_content 其中之一"
 
@@ -48,10 +65,9 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
             except OSError as e:
                 return False, f"读取计划文档失败: {e}"
 
-        # 获取项目上下文（从 system reminder 存储中）
-        from src.core.prompt import get_system_reminder_store
-        store = get_system_reminder_store()
-        project_context = store.get(bucket="code_main_agent", names=["project_context"])
+        # 追加额外指令
+        if extra_instruction.strip():
+            content = f"{content}\n\n<extra_instruction>\n{extra_instruction.strip()}\n</extra_instruction>"
 
         # 调用 Coder Agent
         from ..agents.coder import CoderAgent
@@ -70,7 +86,7 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
         try:
             success, result = await coder.execute(
                 implementation_plan=content,
-                project_context=project_context or "",
+                model_profile=model_profile,
             )
         except Exception as e:
             return False, f"Coder Agent 执行失败: {e}"

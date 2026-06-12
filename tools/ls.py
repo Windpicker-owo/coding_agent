@@ -14,7 +14,7 @@ _EXCLUDE_DIRS = {
     ".git", "__pycache__", "node_modules", ".venv", ".tox",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "htmlcov",
     ".uv-cache", ".uv-cache-local", "dist", "build", ".eggs",
-    ".ruff_cache", ".coverage", ".DS_Store",
+    ".coverage", ".DS_Store",
 }
 
 

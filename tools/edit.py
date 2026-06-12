@@ -61,9 +61,9 @@ class EditTool(CodingToolMixin, BaseTool):
                 if len(suggestions) >= 5:
                     break
 
-            msg = f"未找到精确匹配的内容"
+            msg = "未找到精确匹配的内容"
             if suggestions:
-                msg += f"，可能的近似位置:\n" + "\n".join(suggestions)
+                msg += "，可能的近似位置:\n" + "\n".join(suggestions)
             return False, msg
 
         if count > 1:
@@ -78,7 +78,7 @@ class EditTool(CodingToolMixin, BaseTool):
         if checkpoint_mgr:
             agent_name = getattr(self, "agent_name", "coding_agent")
             checkpoint = await checkpoint_mgr.snapshot_before_write(
-                str(target), agent_name, f"edit: {path}"
+                str(target), agent_name, f"edit: {path}", tool_name="edit"
             )
 
         # 替换

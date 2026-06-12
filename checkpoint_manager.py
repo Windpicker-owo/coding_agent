@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -66,7 +66,8 @@ class CheckpointManager:
         self._git_available: bool = (Path(working_directory) / ".git").is_dir()
 
     async def snapshot_before_write(
-        self, target_path: str, agent_name: str, description: str
+        self, target_path: str, agent_name: str, description: str,
+        tool_name: str = "write",
     ) -> Checkpoint:
         """write/edit 操作前快照目标文件。"""
         self._step_counter += 1
@@ -101,7 +102,7 @@ class CheckpointManager:
         checkpoint = Checkpoint(
             id=str(uuid4()),
             step_index=self._step_counter,
-            tool_name="write",
+            tool_name=tool_name,
             description=description,
             file_snapshots=snapshots,
             timestamp=time.time(),
@@ -234,10 +235,48 @@ class CheckpointManager:
         )
 
     async def _rollback_checkpoint(self, cp: Checkpoint) -> RollbackResult:
-        """回滚单个 checkpoint：逐文件还原。"""
+        """回滚单个 checkpoint：逐文件还原。
+
+        对于 bash checkpoint 且 git 可用时，优先使用 git checkout 恢复，
+        避免因 snapshot 保存时机导致的内容不一致。
+        """
         restored: list[str] = []
         warnings: list[str] = []
 
+        # bash checkpoint + git 可用：直接用 git checkout 恢复文件
+        if cp.tool_name == "bash" and self._git_available and cp.file_snapshots:
+            import asyncio as _asyncio
+            for snapshot in cp.file_snapshots:
+                file_path = snapshot.path
+                try:
+                    proc = await _asyncio.create_subprocess_exec(
+                        "git", "checkout", "--", file_path,
+                        stdout=_asyncio.subprocess.DEVNULL,
+                        stderr=_asyncio.subprocess.PIPE,
+                        cwd=self._working_dir,
+                    )
+                    _, stderr = await _asyncio.wait_for(
+                        proc.communicate(), timeout=10,
+                    )
+                    if proc.returncode == 0:
+                        restored.append(file_path)
+                    else:
+                        err_msg = (
+                            stderr.decode("utf-8", errors="replace").strip()
+                            if stderr else "unknown error"
+                        )
+                        warnings.append(
+                            f"git checkout {file_path} 失败: {err_msg}"
+                        )
+                except Exception as e:
+                    warnings.append(f"git checkout {file_path} 异常: {e}")
+            return RollbackResult(
+                rolled_back_checkpoints=[cp.id],
+                restored_files=restored,
+                warnings=warnings,
+            )
+
+        # 非 bash 或非 git：走逐文件手动恢复
         for snapshot in cp.file_snapshots:
             path = Path(snapshot.path)
             try:

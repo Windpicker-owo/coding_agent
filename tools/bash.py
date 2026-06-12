@@ -40,6 +40,10 @@ class BashTool(CodingToolMixin, BaseTool):
             # 没有活跃会话，直接执行（内部调用场景）
             return await self._execute_command(command, timeout)
 
+        # yolo 模式：跳过所有审批，直接执行（依然走 checkpoint 确保可回滚）
+        if session.yolo_mode:
+            return await self._execute_with_checkpoint(command, timeout, session)
+
         session_mgr = self._get_session_manager()
         perm_mgr = session.permission_manager
 
@@ -67,6 +71,7 @@ class BashTool(CodingToolMixin, BaseTool):
                                 "自动审查已通过，直接执行 bash: "
                                 f"{self._summarize_command(command)}"
                             ),
+                            "source": "agent",
                         },
                     })
                     return await self._execute_with_checkpoint(command, timeout, session)
@@ -74,7 +79,7 @@ class BashTool(CodingToolMixin, BaseTool):
             # 发送审批请求到前端
             request_id = str(uuid.uuid4())
             working_dir = self._get_working_directory()
-            context = f"Coding Agent 请求执行命令"
+            context = "Coding Agent 请求执行命令"
 
             await session_mgr.send_approval_request(
                 session.id, request_id, command, working_dir, context,

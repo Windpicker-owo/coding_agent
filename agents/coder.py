@@ -6,8 +6,8 @@ from typing import Annotated, Any
 
 from src.app.plugin_system.base import BaseAgent
 from src.core.config import get_model_config
-from src.app.plugin_system.api.prompt_api import add_system_reminder
-from src.kernel.llm import LLMPayload, LLMUsable, ROLE, Text, ToolResult
+from src.kernel.llm import LLMPayload, LLMUsable, ModelSet, ROLE, Text, ToolResult
+from ..config import CoderModelProfile
 
 from ..mcp_integration import get_mcp_tools_for_agent
 from ..tools import BashTool, ReadTool, WriteTool, EditTool
@@ -33,34 +33,26 @@ class CoderAgent(BaseAgent):
     async def execute(
         self,
         implementation_plan: Annotated[str, "落地计划文档（Markdown）"],
-        project_context: Annotated[str, "项目上下文摘要"],
+        model_profile: Annotated[
+            str,
+            "可选：指定 Coder 模型 Profile 名称，如 claude-architect。留空使用默认 coding_coder 模型",
+        ] = "",
     ) -> tuple[bool, str | dict]:
-        """实施代码变更。"""
-        model_set = get_model_config().get_task("coding_coder")
+        """实施代码变更。
+
+        支持通过 model_profile 参数选择不同的模型 Profile：
+        - 有值时从 config.model_profiles 查找并构建 ModelSet
+        - 无值时走原有 get_task("coding_coder") 逻辑
+
+        项目上下文和关联项目信息已通过 code_coder reminder 槽位自动注入，
+        无需显式传递。
+        """
+        model_set = self._resolve_model_set(model_profile)
+        if isinstance(model_set, str):
+            # _resolve_model_set 返回了错误消息字符串
+            return False, model_set
         session = get_session_manager().get_session_by_stream_id(self.stream_id)
         session_id = session.id if session else ""
-
-        # 将项目上下文存入 system reminder 存储（fixed 模式，不截断）
-        add_system_reminder(
-            bucket="code_coder",
-            name="project_context",
-            content=f"<project_context>\n{project_context}\n</project_context>",
-            insert_type="fixed",
-            consume="forever",
-        )
-
-        # 注入 skills 目录（如果存在）
-        from ..services.skill_loader import build_skills_catalog
-        if session:
-            catalog = build_skills_catalog(session.working_directory)
-            if catalog:
-                add_system_reminder(
-                    bucket="code_coder",
-                    name="skills",
-                    content=catalog,
-                    insert_type="fixed",
-                    consume="forever",
-                )
 
         # 创建请求，通过 with_reminder 注入 code_coder 槽位
         request = self.create_llm_request(
@@ -122,6 +114,9 @@ class CoderAgent(BaseAgent):
                     response.reasoning_content,
                 )
 
+            # 推送 coder 的上下文用量到前端
+            await self._push_context_usage(session_id, response)
+
             if response.call_list:
                 await self._notify_status(session_id, "coding", "Coder 正在执行实现工具...")
                 for call in response.call_list:
@@ -171,6 +166,29 @@ class CoderAgent(BaseAgent):
             "payload": {
                 "phase": phase,
                 "detail": detail,
+                "source": self._FRONTEND_SOURCE,
+            },
+        })
+
+    async def _push_context_usage(self, session_id: str, response: Any) -> None:
+        """推送 Coder 的 LLM 上下文用量到前端。"""
+        if not session_id:
+            return
+        usage = getattr(response, "_usage", None)
+        if not usage:
+            return
+        total_tokens = usage.get("total_tokens", 0)
+        if not total_tokens:
+            return
+        max_context = 0
+        model_set = getattr(response, "model_set", None)
+        if model_set and isinstance(model_set, list) and len(model_set) > 0:
+            max_context = model_set[0].get("max_context", 0) if isinstance(model_set[0], dict) else 0
+        await get_session_manager().broadcast_to_session(session_id, {
+            "type": "agent.context_usage",
+            "payload": {
+                "total_tokens": total_tokens,
+                "max_context": max_context,
                 "source": self._FRONTEND_SOURCE,
             },
         })
@@ -228,6 +246,36 @@ class CoderAgent(BaseAgent):
                 "source": self._FRONTEND_SOURCE,
             },
         })
+
+    def _resolve_model_set(self, model_profile: str) -> ModelSet | str:
+        """根据 model_profile 参数决议 ModelSet。
+
+        Args:
+            model_profile: Profile 名称，空字符串表示使用默认模型
+
+        Returns:
+            ModelSet（成功）或错误消息字符串（profile 无效）
+        """
+        if not model_profile:
+            return get_model_config().get_task("coding_coder")
+
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return get_model_config().get_task("coding_coder")
+
+        profiles: list[CoderModelProfile] = config.model_profiles
+        if not profiles:
+            return get_model_config().get_task("coding_coder")
+
+        from ..services.model_router import ModelRouter
+
+        router = ModelRouter(profiles)
+        try:
+            profile = router.get_profile(model_profile)
+        except ValueError as e:
+            return str(e)
+
+        return router.build_model_set(profile)
 
     @staticmethod
     def _summarize_args(args: dict[str, Any]) -> str:

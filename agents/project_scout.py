@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 import json_repair
 from src.app.plugin_system.base import BaseAgent
 from src.core.config import get_model_config
-from src.kernel.llm import LLMRequest, LLMPayload, LLMUsable, ROLE, Text, ToolResult
+from src.kernel.llm import LLMPayload, LLMUsable, ROLE, Text, ToolResult
 
 from ..mcp_integration import get_mcp_tools_for_agent
 from ..tools import ReadTool, LsTool, FindTool, GrepTool

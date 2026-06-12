@@ -7,6 +7,20 @@ from typing import ClassVar
 from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
 
 
+class CoderModelProfile(SectionBase):
+    """Coder Agent 模型 Profile，定义一组可选的模型路由参数。
+
+    用于 Main Agent 根据任务特征（标签）为 Coder Agent 选择最合适的模型。
+    """
+
+    profile_name: str = Field(default="", description="Profile 标识名，如 claude-architect")
+    model_name: str = Field(default="", description="model.toml 中的模型名称，如 claude-sonnet-4")
+    tags: list[str] = Field(default_factory=list, description="任务特征标签，如 ['后端', '复杂逻辑']")
+    description: str = Field(default="", description="Profile 适用场景描述")
+    temperature: float | None = Field(default=None, description="覆盖温度参数，None 使用模型默认值")
+    max_tokens: int | None = Field(default=None, description="覆盖最大 token 数，None 使用模型默认值")
+
+
 class CodingAgentConfig(BaseConfig):
     """Coding Agent 配置。"""
 
@@ -54,3 +68,7 @@ class CodingAgentConfig(BaseConfig):
     bash: BashSection = Field(default_factory=BashSection)
     ws: WsSection = Field(default_factory=WsSection)
     mcp: MCPSection = Field(default_factory=MCPSection)
+    model_profiles: list[CoderModelProfile] = Field(
+        default_factory=list,
+        description="Coder Agent 可选模型 Profile 列表，Main Agent 可据此选择模型",
+    )

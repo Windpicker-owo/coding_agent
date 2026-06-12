@@ -6,14 +6,14 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 from src.kernel.logger import get_logger
 
 from .checkpoint_manager import CheckpointManager
 from .permission_manager import PermissionManager
-from .session_store import SessionData, SessionStore, SessionSummary, serialize_payload
+from .session_store import SessionData, SessionStore, SessionSummary
 
 logger = get_logger("coding_agent.session_manager")
 
@@ -34,6 +34,9 @@ class CodingSession:
     websocket: WebSocketLike | None = None  # 由 adapter 设置
     stream_id: str = ""  # 关联的 ChatStream ID
     auto_review_enabled: bool = False
+    yolo_mode: bool = False
+    goal_mode: bool = False
+    goal_text: str = ""
     checkpoint_manager: CheckpointManager | None = None
     permission_manager: PermissionManager | None = None
     pending_approvals: dict[str, asyncio.Event] = field(default_factory=dict)
@@ -92,16 +95,34 @@ class SessionManager:
 
     async def resume_session(
         self, conn_id: str, working_directory: str, session_id: str
-    ) -> CodingSession | None:
+    ) -> tuple[CodingSession | None, str]:
         """从持久化存储恢复会话。
 
         不会检查 TTL 过期——恢复时信任缓存。
+
+        Returns:
+            (session, warning) 元组，warning 非空时表示 working_directory 不匹配。
         """
         store = self._get_store(working_directory)
         data = await store.load(session_id)
         if data is None:
             logger.warning(f"会话 {session_id} 不存在，无法恢复")
-            return None
+            return None, ""
+
+        # 校验 working_directory 一致性
+        warning = ""
+        stored_dir = data.working_directory
+        if stored_dir and stored_dir != working_directory:
+            logger.warning(
+                f"恢复会话 {session_id[:8]} 时 working_directory 不匹配: "
+                f"客户端={working_directory}, 存储={stored_dir}，使用存储值"
+            )
+            warning = (
+                f"工作目录不匹配：会话创建于 {stored_dir}，"
+                f"当前为 {working_directory}。将使用原始目录恢复。"
+            )
+            # 使用存储的 working_directory 恢复，因为 session 数据和文件都在那个目录下
+            working_directory = stored_dir
 
         if working_directory not in self._permission_managers:
             self._permission_managers[working_directory] = PermissionManager(working_directory)
@@ -124,7 +145,7 @@ class SessionManager:
 
         self._sessions[session_id] = session
         logger.info(f"会话 {session_id[:8]} 已从磁盘恢复，标题: {data.title!r}")
-        return session
+        return session, warning
 
     async def save_session_state(
         self, session_id: str, payloads: list[dict],

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from typing import Annotated
 
 import json_repair
 from src.app.plugin_system.base import BaseAgent
 from src.core.config import get_model_config
-from src.kernel.llm import LLMRequest, LLMPayload, ROLE, Text
+from src.kernel.llm import LLMPayload, ROLE, Text
 
 from ..prompts import AUTO_REVIEWER_PROMPT, render_prompt
 from ..services.terminal_environment import get_preferred_terminal_from_config

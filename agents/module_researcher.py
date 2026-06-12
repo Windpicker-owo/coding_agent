@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 import json_repair
 from src.app.plugin_system.base import BaseAgent

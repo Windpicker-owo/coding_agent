@@ -6,7 +6,6 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 
 logger = get_logger("coding_agent.orchestration")
@@ -123,7 +122,6 @@ class CodingOrchestrator:
 
         tasks = [_research_one(i, target) for i, target in enumerate(targets)]
 
-        tm = get_task_manager()
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         reports: list[ResearchReport] = []
@@ -206,7 +204,7 @@ class CodingOrchestrator:
         return result
 
     async def run_coder_session(
-        self, plan: str, project_context: str
+        self, plan: str
     ) -> CoderResult:
         """创建 CoderAgent 执行落地计划。"""
         from .agents.coder import CoderAgent
@@ -214,7 +212,6 @@ class CodingOrchestrator:
         coder = CoderAgent(stream_id=self._stream_id, plugin=self._plugin)
         success, result = await coder.execute(
             implementation_plan=plan,
-            project_context=project_context,
         )
 
         summary = result if isinstance(result, str) else str(result)

@@ -186,7 +186,7 @@ class SessionStore:
             suffix=".json", prefix="session_", dir=str(self._sessions_dir)
         )
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            with open(tmp_fd, "w", encoding="utf-8", closefd=True) as f:
                 f.write(content)
             os.replace(tmp_path, target)
         except Exception:
@@ -235,7 +235,7 @@ class SessionStore:
                 suffix=".json", prefix="session_", dir=str(self._sessions_dir)
             )
             try:
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                with open(tmp_fd, "w", encoding="utf-8", closefd=True) as f:
                     json.dump(raw, f, indent=2, ensure_ascii=False, default=str)
                 os.replace(tmp_path, path)
             except Exception:
