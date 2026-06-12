@@ -6,9 +6,19 @@ from typing import Annotated, Any
 
 from src.app.plugin_system.base import BaseAgent
 from src.core.config import get_model_config
-from src.kernel.llm import LLMPayload, LLMUsable, ModelSet, ROLE, Text, ToolResult
+from src.kernel.llm import (
+    LLMContextManager,
+    LLMPayload,
+    LLMUsable,
+    ModelSet,
+    ROLE,
+    ReminderSourceSpec,
+    Text,
+    ToolResult,
+)
 from ..config import CoderModelProfile
 
+from ..context_compression import coding_context_compression_handler
 from ..mcp_integration import get_mcp_tools_for_agent
 from ..tools import BashTool, ReadTool, WriteTool, EditTool
 from ..prompts import CODER_AGENT_PROMPT, render_prompt
@@ -54,13 +64,24 @@ class CoderAgent(BaseAgent):
         session = get_session_manager().get_session_by_stream_id(self.stream_id)
         session_id = session.id if session else ""
 
-        # 创建请求，通过 with_reminder 注入 code_coder 槽位
+        # 创建请求，通过 context_manager 注入 code_coder 槽位和压缩处理器
+        context_manager = LLMContextManager(
+            context_compression_handler=coding_context_compression_handler,
+            reminder_sources=[
+                ReminderSourceSpec(
+                    bucket="code_coder",
+                    wrap_with_system_tag=True,
+                )
+            ],
+        )
         request = self.create_llm_request(
             model_set,
             "coder",
             with_usables=True,
-            with_reminder="code_coder",
+            context_manager=context_manager,
         )
+        # 确保 stream_id 在 meta_data 中，供压缩处理器推导 session_id
+        request.meta_data["stream_id"] = self.stream_id
         terminal_environment = get_preferred_terminal_from_config(
             getattr(self.plugin, "config", None)
         )
@@ -181,15 +202,30 @@ class CoderAgent(BaseAgent):
         if not total_tokens:
             return
         max_context = 0
+        model_name = ""
+        cost = 0.0
         model_set = getattr(response, "model_set", None)
         if model_set and isinstance(model_set, list) and len(model_set) > 0:
-            max_context = model_set[0].get("max_context", 0) if isinstance(model_set[0], dict) else 0
+            model_entry = model_set[0]
+            if isinstance(model_entry, dict):
+                max_context = model_entry.get("max_context", 0)
+                model_name = model_entry.get("model_identifier", "")
+                try:
+                    from src.kernel.llm.observation import calculate_request_cost
+                    cost = calculate_request_cost(model=model_entry, usage=usage)
+                except Exception:
+                    pass
         await get_session_manager().broadcast_to_session(session_id, {
             "type": "agent.context_usage",
             "payload": {
                 "total_tokens": total_tokens,
                 "max_context": max_context,
                 "source": self._FRONTEND_SOURCE,
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "cache_hit_tokens": usage.get("cache_hit_tokens", 0),
+                "model_name": model_name,
+                "cost": cost,
             },
         })
 

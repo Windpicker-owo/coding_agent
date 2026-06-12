@@ -21,6 +21,7 @@ from .prompts import MAIN_AGENT_SYSTEM_PROMPT, render_prompt
 from .session_manager import get_session_manager
 from .session_store import deserialize_payload, serialize_payload
 from .mcp_integration import get_mcp_tools_for_agent
+from .context_compression import coding_context_compression_handler
 from .services.gitignore_scope import GitIgnoreScope
 from .services.project_context import ProjectContextService
 from .services.terminal_environment import get_preferred_terminal_from_config
@@ -578,6 +579,11 @@ class CodingAgentChatter(BaseChatter):
             with_reminder="code_main_agent",
         )
 
+        # 替换为编程场景专用的上下文压缩处理器
+        request.context_manager.context_compression_handler = (
+            coding_context_compression_handler
+        )
+
         # 填充人格信息
         system_prompt = self._build_system_prompt()
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
@@ -839,11 +845,21 @@ class CodingAgentChatter(BaseChatter):
         if not total_tokens:
             return
 
-        # 从 model_set 获取 max_context（上下文窗口大小）
+        # 从 model_set 获取 max_context（上下文窗口大小）和模型标识
         max_context = 0
+        model_name = ""
+        cost = 0.0
         model_set = getattr(current, "model_set", None)
         if model_set and isinstance(model_set, list) and len(model_set) > 0:
-            max_context = model_set[0].get("max_context", 0) if isinstance(model_set[0], dict) else 0
+            model_entry = model_set[0]
+            if isinstance(model_entry, dict):
+                max_context = model_entry.get("max_context", 0)
+                model_name = model_entry.get("model_identifier", "")
+                try:
+                    from src.kernel.llm.observation import calculate_request_cost
+                    cost = calculate_request_cost(model=model_entry, usage=usage)
+                except Exception:
+                    pass
 
         await get_session_manager().broadcast_to_session(session_id, {
             "type": "agent.context_usage",
@@ -851,6 +867,11 @@ class CodingAgentChatter(BaseChatter):
                 "total_tokens": total_tokens,
                 "max_context": max_context,
                 "source": "agent",
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "cache_hit_tokens": usage.get("cache_hit_tokens", 0),
+                "model_name": model_name,
+                "cost": cost,
             },
         })
 
