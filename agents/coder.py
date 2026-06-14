@@ -7,6 +7,7 @@ import time
 from typing import Annotated, Any
 
 from src.app.plugin_system.base import BaseAgent
+from src.app.plugin_system.api.prompt_api import get_template
 from src.core.config import get_model_config
 from src.kernel.llm import (
     LLMContextManager,
@@ -23,7 +24,7 @@ from ..config import CoderModelProfile
 from ..context_compression import coding_context_compression_handler
 from ..mcp_integration import get_mcp_tools_for_agent
 from ..tools import BashTool, ReadTool, WriteTool, EditTool
-from ..prompts import CODER_AGENT_PROMPT, render_prompt
+from ..prompts import build_environment_info
 from ..session_manager import get_session_manager
 from ..services.terminal_environment import get_preferred_terminal_from_config
 
@@ -39,6 +40,16 @@ class CoderAgent(BaseAgent):
     _FRONTEND_SOURCE = "coder"
     _AUTO_SAVE_MIN_INTERVAL: float = 3.0  # 防抖自动保存最小间隔秒数
     _FINAL_GUIDANCE_GRACE_SECONDS: float = 0.35  # 收尾前短暂等待追加引导转发
+
+    def _get_model_task(self, key: str, default: str) -> str:
+        """从插件配置安全读取模型任务名。"""
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return default
+        model = getattr(config, "model", None)
+        if model is None:
+            return default
+        return getattr(model, key, default) or default
 
     def _get_extra_usables(self) -> list[type[LLMUsable]]:
         """注入 MCP 工具（coder Agent）。"""
@@ -96,9 +107,14 @@ class CoderAgent(BaseAgent):
         )
 
         # System prompt 包含落地计划（不含项目上下文）
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(
-            render_prompt(CODER_AGENT_PROMPT, terminal_environment=terminal_environment)
-        )))
+        tmpl = get_template("coding_agent.coder")
+        if tmpl is not None:
+            tmpl.set("environment_info", build_environment_info(terminal_environment))
+            system_prompt = await tmpl.build()
+        else:
+            system_prompt = ""
+
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
         request.add_payload(LLMPayload(ROLE.USER, Text(
             "请根据以下落地计划开始实施，并严格限制在计划范围内：\n"
             f"<implementation_plan>\n{implementation_plan}\n</implementation_plan>"
@@ -407,16 +423,17 @@ class CoderAgent(BaseAgent):
         Returns:
             ModelSet（成功）或错误消息字符串（profile 无效）
         """
+        coder_task = self._get_model_task("coder_task", "coding_coder")
         if not model_profile:
-            return get_model_config().get_task("coding_coder")
+            return get_model_config().get_task(coder_task)
 
         config = getattr(self.plugin, "config", None)
         if config is None:
-            return get_model_config().get_task("coding_coder")
+            return get_model_config().get_task(coder_task)
 
         profiles: list[CoderModelProfile] = config.model_profiles
         if not profiles:
-            return get_model_config().get_task("coding_coder")
+            return get_model_config().get_task(coder_task)
 
         from ..services.model_router import ModelRouter
 

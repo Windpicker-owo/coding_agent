@@ -1,7 +1,7 @@
 {
     "name": "coding_agent",
     "display_name": "Coding Agent",
-    "version": "0.2.6",
+    "version": "0.2.9",
     "description": "类 Claude Code 的编程智能体，前后端分离架构",
     "author": "MoFox Team",
     "dependencies": {
@@ -35,5 +35,5 @@
         {"component_type": "agent", "component_name": "auto_reviewer", "dependencies": []}
     ],
     "entry_point": "plugin.py",
-    "min_core_version": "1.2.0-rc"
+    "min_core_version": "1.2.0-rc.1"
 }

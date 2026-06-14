@@ -6,12 +6,13 @@ from typing import Annotated
 
 import json_repair
 from src.app.plugin_system.base import BaseAgent
+from src.app.plugin_system.api.prompt_api import get_template
 from src.core.config import get_model_config
 from src.kernel.llm import LLMPayload, LLMUsable, ROLE, Text, ToolResult
 
 from ..mcp_integration import get_mcp_tools_for_agent
 from ..tools import ReadTool, LsTool, FindTool, GrepTool
-from ..prompts import PROJECT_SCOUT_PROMPT, render_prompt
+from ..prompts import build_environment_info
 from ..services.terminal_environment import get_preferred_terminal_from_config
 
 
@@ -24,6 +25,16 @@ class ProjectScoutAgent(BaseAgent):
     associated_types = ["text"]
     usables = [ReadTool, LsTool, FindTool, GrepTool]  # 严格只读
 
+    def _get_model_task(self, key: str, default: str) -> str:
+        """从插件配置安全读取模型任务名。"""
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return default
+        model = getattr(config, "model", None)
+        if model is None:
+            return default
+        return getattr(model, key, default) or default
+
     def _get_extra_usables(self) -> list[type[LLMUsable]]:
         """注入 MCP 工具（researcher Agent）。"""
         return get_mcp_tools_for_agent(self.plugin, "researcher")
@@ -35,7 +46,8 @@ class ProjectScoutAgent(BaseAgent):
     ) -> tuple[bool, str | dict]:
         """执行项目侦察。"""
         # 获取模型配置
-        model_set = get_model_config().get_task("coding_researcher")
+        task_name = self._get_model_task("researcher_task", "coding_researcher")
+        model_set = get_model_config().get_task(task_name)
 
         # 创建 LLM 请求
         request = self.create_llm_request(
@@ -47,9 +59,14 @@ class ProjectScoutAgent(BaseAgent):
             getattr(self.plugin, "config", None)
         )
 
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(
-            render_prompt(PROJECT_SCOUT_PROMPT, terminal_environment=terminal_environment)
-        )))
+        tmpl = get_template("coding_agent.project_scout")
+        if tmpl is not None:
+            tmpl.set("environment_info", build_environment_info(terminal_environment))
+            system_prompt = await tmpl.build()
+        else:
+            system_prompt = ""
+
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
         user_prompt = f"侦察项目：{project_root}"
         if gitignore_content.strip():
             user_prompt += (

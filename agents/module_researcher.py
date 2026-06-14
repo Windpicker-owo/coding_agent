@@ -6,12 +6,13 @@ from typing import Annotated
 
 import json_repair
 from src.app.plugin_system.base import BaseAgent
+from src.app.plugin_system.api.prompt_api import get_template
 from src.core.config import get_model_config
 from src.kernel.llm import LLMPayload, LLMUsable, ROLE, Text, ToolResult
 
 from ..mcp_integration import get_mcp_tools_for_agent
 from ..tools import ReadTool, GrepTool, FindTool, LsTool
-from ..prompts import MODULE_RESEARCHER_PROMPT, render_prompt
+from ..prompts import build_environment_info
 from ..services.terminal_environment import get_preferred_terminal_from_config
 
 
@@ -24,6 +25,16 @@ class ModuleResearcherAgent(BaseAgent):
     associated_types = ["text"]
     usables = [ReadTool, GrepTool, FindTool, LsTool]  # 严格只读
 
+    def _get_model_task(self, key: str, default: str) -> str:
+        """从插件配置安全读取模型任务名。"""
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return default
+        model = getattr(config, "model", None)
+        if model is None:
+            return default
+        return getattr(model, key, default) or default
+
     def _get_extra_usables(self) -> list[type[LLMUsable]]:
         """注入 MCP 工具（researcher Agent）。"""
         return get_mcp_tools_for_agent(self.plugin, "researcher")
@@ -35,7 +46,8 @@ class ModuleResearcherAgent(BaseAgent):
         gitignore_content: Annotated[str, "项目根目录 .gitignore 内容，可为空"] = "",
     ) -> tuple[bool, str | dict]:
         """执行模块研究。"""
-        model_set = get_model_config().get_task("coding_researcher")
+        task_name = self._get_model_task("researcher_task", "coding_researcher")
+        model_set = get_model_config().get_task(task_name)
 
         request = self.create_llm_request(
             model_set, "module_researcher",
@@ -46,9 +58,14 @@ class ModuleResearcherAgent(BaseAgent):
             getattr(self.plugin, "config", None)
         )
 
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(
-            render_prompt(MODULE_RESEARCHER_PROMPT, terminal_environment=terminal_environment)
-        )))
+        tmpl = get_template("coding_agent.module_researcher")
+        if tmpl is not None:
+            tmpl.set("environment_info", build_environment_info(terminal_environment))
+            system_prompt = await tmpl.build()
+        else:
+            system_prompt = ""
+
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
         user_prompt = f"研究模块：{module_path}\n研究重点：{research_focus}"
         if gitignore_content.strip():
             user_prompt += (

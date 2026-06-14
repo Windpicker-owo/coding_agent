@@ -12,13 +12,13 @@ from src.app.plugin_system.base import (
 )
 from src.app.plugin_system.types import ChatType
 
-from src.app.plugin_system.api.prompt_api import add_system_reminder
+from src.app.plugin_system.api.prompt_api import add_system_reminder, get_template
 from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, ToolResult, ToolRegistry
 from src.kernel.logger import get_logger, COLOR
 
 from .config import CodingAgentConfig
 from .orchestration import CodingOrchestrator
-from .prompts import MAIN_AGENT_SYSTEM_PROMPT, SOLO_AGENT_SYSTEM_PROMPT, render_prompt
+from .prompts import build_environment_info
 from .session_manager import get_session_manager
 from .session_store import deserialize_payload, serialize_payload
 from .mcp_integration import get_mcp_tools_for_agent
@@ -84,9 +84,9 @@ class CodingAgentChatter(BaseChatter):
 
             # 恢复模式根据 solo_mode 选择不同构建方式
             if session.solo_mode:
-                current, registry = self._build_solo_request(project_context)
+                current, registry = await self._build_solo_request(project_context)
             else:
-                current, registry = self._build_clean_request(project_context)
+                current, registry = await self._build_clean_request(project_context)
 
             # 回放历史 payloads（跳过 SYSTEM 和 TOOL，_build_clean_request 已生成）
             # 同时统计消息数
@@ -118,7 +118,7 @@ class CodingAgentChatter(BaseChatter):
             logger.info(f"会话 {session.id[:8]} 进入 Solo 模式，"
                         f"model={session.solo_model!r}")
 
-            current, registry = self._build_solo_request(None)
+            current, registry = await self._build_solo_request(None)
 
             self._current_request = current
             await self._notify_status("ready", "Solo 模式已就绪")
@@ -148,7 +148,7 @@ class CodingAgentChatter(BaseChatter):
             await context_svc.save_context(project_root, project_context)
 
         # Phase 2：构建初始请求
-        current, registry = self._build_clean_request(project_context)
+        current, registry = await self._build_clean_request(project_context)
         self._current_request = current
 
         # 存储 project_context 到 session，供 _auto_save 持久化使用
@@ -195,11 +195,11 @@ class CodingAgentChatter(BaseChatter):
 
                     # 构建全新的干净上下文，不受前面对话影响
                     current = self.create_request(
-                        task="coding_main",
+                        task=self._get_model_task("main_task", "coding_main"),
                         request_name="coding_goal_review",
                         with_reminder="code_main_agent",
                     )
-                    current.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(
+                    current.add_payload(LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(
                         solo_mode=session.solo_mode,
                     ))))
                     current.add_payload(LLMPayload(ROLE.USER, Text(
@@ -475,9 +475,9 @@ class CodingAgentChatter(BaseChatter):
         project_context = session._resume_project_context if session else None
 
         if session and session.solo_mode:
-            current, _ = self._build_solo_request(project_context)
+            current, _ = await self._build_solo_request(project_context)
         else:
-            current, _ = self._build_clean_request(project_context)
+            current, _ = await self._build_clean_request(project_context)
 
         history_count = 0
         for pdata in payloads_data:
@@ -561,7 +561,7 @@ class CodingAgentChatter(BaseChatter):
         """使用小模型根据首条用户消息生成会话标题（不超过15字）。"""
         try:
             title_request = self.create_request(
-                task="coding_title",
+                task=self._get_model_task("title_task", "coding_title"),
                 request_name="coding_title",
             )
 
@@ -645,7 +645,7 @@ class CodingAgentChatter(BaseChatter):
 
         return result
 
-    def _build_clean_request(self, project_context: dict | None) -> tuple[LLMRequest, ToolRegistry]:
+    async def _build_clean_request(self, project_context: dict | None) -> tuple[LLMRequest, ToolRegistry]:
         """构建干净的主 agent 请求。"""
         # 只有当 project_context 有效时才设置 reminder
         if project_context and isinstance(project_context, dict):
@@ -698,7 +698,7 @@ class CodingAgentChatter(BaseChatter):
 
         # 构建请求，通过 with_reminder 注入 system reminder 槽位
         request = self.create_request(
-            task="coding_main",
+            task=self._get_model_task("main_task", "coding_main"),
             request_name="coding_agent",
             with_reminder="code_main_agent",
         )
@@ -709,7 +709,7 @@ class CodingAgentChatter(BaseChatter):
         )
 
         # 填充人格信息
-        system_prompt = self._build_system_prompt()
+        system_prompt = await self._build_system_prompt()
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
         # 注入工具
@@ -730,13 +730,13 @@ class CodingAgentChatter(BaseChatter):
 
         return request, registry
 
-    def _build_solo_request(self, project_context: dict | None) -> tuple[LLMRequest, ToolRegistry]:
+    async def _build_solo_request(self, project_context: dict | None) -> tuple[LLMRequest, ToolRegistry]:
         """构建 Solo 模式的请求：单一 agent 完成所有工作，不注册 create_plan 和 implement_plan。"""
         session_mgr = get_session_manager()
         session = session_mgr.get_session_by_stream_id(self.stream_id)
 
         # 确定使用的 task 名
-        task_name = session.solo_model if session and session.solo_model else "coding_main"
+        task_name = session.solo_model if session and session.solo_model else self._get_model_task("main_task", "coding_main")
 
         # 构建请求，使用 code_main_agent reminder 桶
         request = self.create_request(
@@ -751,7 +751,7 @@ class CodingAgentChatter(BaseChatter):
         )
 
         # 填充人格信息（solo 模式）
-        system_prompt = self._build_system_prompt(solo_mode=True)
+        system_prompt = await self._build_system_prompt(solo_mode=True)
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
         # 注入工具（与 Coder Agent 一致：Bash/Read/Write/Edit + MCP）
@@ -771,7 +771,17 @@ class CodingAgentChatter(BaseChatter):
 
         return request, registry
 
-    def _build_system_prompt(self, solo_mode: bool = False) -> str:
+    def _get_model_task(self, key: str, default: str) -> str:
+        """从插件配置安全读取模型任务名。"""
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return default
+        model = getattr(config, "model", None)
+        if model is None:
+            return default
+        return getattr(model, key, default) or default
+
+    async def _build_system_prompt(self, solo_mode: bool = False) -> str:
         """构建填充了人格信息的 system prompt。"""
         try:
             from src.core.config import get_core_config
@@ -796,26 +806,26 @@ class CodingAgentChatter(BaseChatter):
             cast(CodingAgentConfig | None, getattr(self.plugin, "config", None))
         )
 
-        template = SOLO_AGENT_SYSTEM_PROMPT if solo_mode else MAIN_AGENT_SYSTEM_PROMPT
-        prompt = render_prompt(template,
-            terminal_environment=terminal_environment,
-            nickname=nickname or "Coding Agent",
-            alias_names=alias_names or nickname or "Coding Agent",
-            personality_core=personality_core or "是一个专业的编程助手",
-            personality_side=personality_side or "",
-            identity=identity or "编程智能体",
-            reply_style=reply_style or "保持专业、简洁、清晰",
-            background_story=background_story or "",
-        )
+        template_name = "coding_agent.solo_agent" if solo_mode else "coding_agent.main_agent"
+        tmpl = get_template(template_name)
+        if tmpl is None:
+            # 模板未注册时降级为空 prompt
+            return ""
+
+        tmpl.set("nickname", nickname or "Coding Agent")
+        tmpl.set("alias_names", alias_names or nickname or "Coding Agent")
+        tmpl.set("personality_core", personality_core or "是一个专业的编程助手")
+        tmpl.set("personality_side", personality_side or "")
+        tmpl.set("identity", identity or "编程智能体")
+        tmpl.set("reply_style", reply_style or "保持专业、简洁、清晰")
+        tmpl.set("background_story", background_story or "")
+        tmpl.set("environment_info", build_environment_info(terminal_environment))
 
         # 注入 Coder 模型 Profile 列表（solo 模式不需要）
-        if solo_mode:
-            prompt = prompt.replace("[[coder_model_profiles]]", "")
-        else:
-            coder_profiles_text = self._get_coder_profiles_text()
-            prompt = prompt.replace("[[coder_model_profiles]]", coder_profiles_text)
+        if not solo_mode:
+            tmpl.set("coder_model_profiles", self._get_coder_profiles_text())
 
-        return prompt
+        return await tmpl.build()
 
     def _get_coder_profiles_text(self) -> str:
         """从插件配置读取 model_profiles 并生成 prompt 文本。

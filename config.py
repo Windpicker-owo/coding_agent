@@ -34,6 +34,7 @@ class CodingAgentConfig(BaseConfig):
         researcher_task: str = Field(default="coding_researcher", description="研究员模型任务名")
         coder_task: str = Field(default="coding_coder", description="编码员模型任务名")
         reviewer_task: str = Field(default="coding_reviewer", description="自动审查模型任务名")
+        title_task: str = Field(default="coding_title", description="标题生成模型任务名")
 
     @config_section("context", title="上下文管理", tag="ai")
     class ContextSection(SectionBase):

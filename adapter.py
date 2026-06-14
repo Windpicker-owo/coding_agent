@@ -427,6 +427,25 @@ class CodingAgentAdapter(BaseAdapter):
                     "payload": {"session_id": target_id, "success": True},
                 })
 
+        elif msg_type == "session.rename":
+            payload = raw.get("payload", {})
+            target_id = payload.get("session_id", "")
+            new_title = str(payload.get("title", "") or "").strip()[:60]
+            if target_id and new_title:
+                # 更新内存中的标题（仅对已加载的会话生效）
+                await session_mgr.update_session_title(target_id, new_title)
+                # 确保磁盘持久化（对历史会话也生效）
+                if session.session_store:
+                    await session.session_store.update_title(target_id, new_title)
+                await session_mgr.broadcast_to_session(session_id, {
+                    "type": "session.rename_result",
+                    "payload": {
+                        "session_id": target_id,
+                        "title": new_title,
+                        "success": True,
+                    },
+                })
+
         elif msg_type == "bash.approval":
             payload = raw.get("payload", {})
             await session_mgr.submit_approval(

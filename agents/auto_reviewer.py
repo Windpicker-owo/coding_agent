@@ -6,10 +6,11 @@ from typing import Annotated
 
 import json_repair
 from src.app.plugin_system.base import BaseAgent
+from src.app.plugin_system.api.prompt_api import get_template
 from src.core.config import get_model_config
 from src.kernel.llm import LLMPayload, ROLE, Text
 
-from ..prompts import AUTO_REVIEWER_PROMPT, render_prompt
+from ..prompts import build_environment_info
 from ..services.terminal_environment import get_preferred_terminal_from_config
 
 
@@ -22,6 +23,16 @@ class AutoReviewAgent(BaseAgent):
     associated_types = ["text"]
     usables = []  # 无工具
 
+    def _get_model_task(self, key: str, default: str) -> str:
+        """从插件配置安全读取模型任务名。"""
+        config = getattr(self.plugin, "config", None)
+        if config is None:
+            return default
+        model = getattr(config, "model", None)
+        if model is None:
+            return default
+        return getattr(model, key, default) or default
+
     async def execute(
         self,
         command: Annotated[str, "待审查的 bash 命令"],
@@ -29,15 +40,22 @@ class AutoReviewAgent(BaseAgent):
         task_context: Annotated[str, "当前任务上下文摘要"],
     ) -> tuple[bool, dict]:
         """审查命令安全性。"""
-        model_set = get_model_config().get_task("coding_reviewer")
+        task_name = self._get_model_task("reviewer_task", "coding_reviewer")
+        model_set = get_model_config().get_task(task_name)
         terminal_environment = get_preferred_terminal_from_config(
             getattr(self.plugin, "config", None)
         )
 
         request = self.create_llm_request(model_set, "auto_review")
-        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(
-            render_prompt(AUTO_REVIEWER_PROMPT, terminal_environment=terminal_environment)
-        )))
+
+        tmpl = get_template("coding_agent.auto_reviewer")
+        if tmpl is not None:
+            tmpl.set("environment_info", build_environment_info(terminal_environment))
+            system_prompt = await tmpl.build()
+        else:
+            system_prompt = ""
+
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
         request.add_payload(LLMPayload(ROLE.USER, Text(
             f"命令: {command}\n目录: {working_directory}\n上下文: {task_context}"
         )))
