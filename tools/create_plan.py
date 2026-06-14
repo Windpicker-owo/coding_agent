@@ -46,17 +46,16 @@ class CreatePlanTool(CodingToolMixin, BaseTool):
         plan_path = context_dir / filename
 
         try:
+            full_content = f"# {title}\n\n> Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n{content}"
             async with aiofiles.open(plan_path, "w", encoding="utf-8", newline="") as f:
-                await f.write(f"# {title}\n\n")
-                await f.write(f"> Created: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                await f.write(content)
+                await f.write(full_content)
         except OSError as e:
             return False, f"写入计划文档失败: {e}"
 
         relative_path = str(plan_path.relative_to(work_dir))
 
         # 通知前端
-        await self._notify_file_change(relative_path, "create")
+        await self._notify_file_change(relative_path, "create", content=full_content)
 
         return True, (
             f"计划文档已创建: {relative_path}\n"

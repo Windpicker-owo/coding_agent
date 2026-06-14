@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import aiofiles
 from src.app.plugin_system.base import BaseTool
 
 from .base import CodingToolMixin
+from ..services.coder_retry import execute_with_retry
 
 
 class ImplementPlanTool(CodingToolMixin, BaseTool):
@@ -44,6 +45,7 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
             model_profile: Coder 模型 Profile 名称，由 Main Agent 根据任务标签决策
             extra_instruction: 追加到计划末尾的额外指令
         """
+        self._ensure_not_interrupted()
         if not plan_path and not plan_content:
             return False, "必须提供 plan_path 或 plan_content 其中之一"
 
@@ -69,9 +71,6 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
         if extra_instruction.strip():
             content = f"{content}\n\n<extra_instruction>\n{extra_instruction.strip()}\n</extra_instruction>"
 
-        # 调用 Coder Agent
-        from ..agents.coder import CoderAgent
-
         session = self._get_current_session()
         if session is None:
             return False, "无法获取当前会话"
@@ -81,16 +80,40 @@ class ImplementPlanTool(CodingToolMixin, BaseTool):
             return False, "无法获取插件实例"
 
         stream_id = getattr(self, "stream_id", "")
-        coder = CoderAgent(stream_id=stream_id, plugin=plugin)
-
-        try:
+        async def _executor(profile_name: str) -> tuple[bool, str]:
+            self._ensure_not_interrupted()
+            coder = self._create_coder_agent(stream_id, plugin)
             success, result = await coder.execute(
                 implementation_plan=content,
-                model_profile=model_profile,
+                model_profile=profile_name,
             )
-        except Exception as e:
-            return False, f"Coder Agent 执行失败: {e}"
+            return success, result if isinstance(result, str) else str(result)
+
+        success, result = await execute_with_retry(
+            executor=_executor,
+            requested_profile=model_profile,
+            notify=lambda detail: self._notify_retry_status(session.id, detail),
+        )
 
         result_str = result if isinstance(result, str) else str(result)
         status = "成功" if success else "失败"
         return success, f"[Coder Agent {status}]\n{result_str}"
+
+    def _create_coder_agent(self, stream_id: str, plugin: Any) -> Any:
+        """创建新的 Coder Agent 实例。"""
+        from ..agents.coder import CoderAgent
+
+        return CoderAgent(stream_id=stream_id, plugin=plugin)
+
+    async def _notify_retry_status(self, session_id: str, detail: str) -> None:
+        """向前端广播重试状态。"""
+        if not session_id:
+            return
+        await self._get_session_manager().broadcast_to_session(session_id, {
+            "type": "agent.status",
+            "payload": {
+                "phase": "coding",
+                "detail": detail,
+                "source": "agent",
+            },
+        })

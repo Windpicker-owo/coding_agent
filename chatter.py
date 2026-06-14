@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, AsyncGenerator, cast
 
 from src.app.plugin_system.base import (
@@ -17,7 +18,7 @@ from src.kernel.logger import get_logger, COLOR
 
 from .config import CodingAgentConfig
 from .orchestration import CodingOrchestrator
-from .prompts import MAIN_AGENT_SYSTEM_PROMPT, render_prompt
+from .prompts import MAIN_AGENT_SYSTEM_PROMPT, SOLO_AGENT_SYSTEM_PROMPT, render_prompt
 from .session_manager import get_session_manager
 from .session_store import deserialize_payload, serialize_payload
 from .mcp_integration import get_mcp_tools_for_agent
@@ -43,7 +44,6 @@ class CodingAgentChatter(BaseChatter):
     stream_tick_interval = 0.5
     associated_platforms = ["coding_agent"]
     chat_type = ChatType.PRIVATE
-    _MAX_SILENT_TOOL_ROUNDS = 3
 
     def __init__(self, stream_id: str, plugin: Any) -> None:
         super().__init__(stream_id, plugin)
@@ -54,6 +54,8 @@ class CodingAgentChatter(BaseChatter):
         self._last_trigger_msgs: list = []  # 最近一次有效触发消息，goal 审查时 fallback
         self._is_goal_review_round: bool = False  # 当前轮次是否为 goal 审查轮
         self._goal_round_modified: bool = False  # goal 审查本轮是否使用了修改性工具
+        self._last_auto_save_time: float = 0.0  # 上次自动保存时间戳
+        self._auto_save_min_interval: float = 3.0  # 自动保存最小间隔秒数
 
     async def execute(self) -> AsyncGenerator[
         Wait | Success | Failure | Stop,
@@ -79,7 +81,12 @@ class CodingAgentChatter(BaseChatter):
                         f"历史消息 {len(session._resume_payloads)} 条")
 
             project_context = session._resume_project_context
-            current, registry = self._build_clean_request(project_context)
+
+            # 恢复模式根据 solo_mode 选择不同构建方式
+            if session.solo_mode:
+                current, registry = self._build_solo_request(project_context)
+            else:
+                current, registry = self._build_clean_request(project_context)
 
             # 回放历史 payloads（跳过 SYSTEM 和 TOOL，_build_clean_request 已生成）
             # 同时统计消息数
@@ -99,6 +106,22 @@ class CodingAgentChatter(BaseChatter):
 
             self._current_request = current
             await self._notify_status("ready", "会话已恢复，等待输入")
+
+            async for event in self._interaction_loop(
+                current, registry, session.id,
+            ):
+                yield event
+            return
+
+        # ── Solo 模式：跳过项目研究，直接进入交互循环 ──
+        if session.solo_mode:
+            logger.info(f"会话 {session.id[:8]} 进入 Solo 模式，"
+                        f"model={session.solo_model!r}")
+
+            current, registry = self._build_solo_request(None)
+
+            self._current_request = current
+            await self._notify_status("ready", "Solo 模式已就绪")
 
             async for event in self._interaction_loop(
                 current, registry, session.id,
@@ -176,18 +199,26 @@ class CodingAgentChatter(BaseChatter):
                         request_name="coding_goal_review",
                         with_reminder="code_main_agent",
                     )
-                    current.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt())))
+                    current.add_payload(LLMPayload(ROLE.SYSTEM, Text(self._build_system_prompt(
+                        solo_mode=session.solo_mode,
+                    ))))
                     current.add_payload(LLMPayload(ROLE.USER, Text(
-                        self._build_goal_review_prompt(session.goal_text)
+                        self._build_goal_review_prompt(session.goal_text, session.goal_doc_path)
                     )))
 
                     # 注册工具
                     registry = ToolRegistry()
-                    for tool_cls in [
-                        BashTool, ReadTool, WriteTool, EditTool,
-                        CreatePlanTool, ImplementPlanTool,
-                    ]:
-                        registry.register(tool_cls)
+                    if session.solo_mode:
+                        for tool_cls in [
+                            BashTool, ReadTool, WriteTool, EditTool,
+                        ]:
+                            registry.register(tool_cls)
+                    else:
+                        for tool_cls in [
+                            BashTool, ReadTool, WriteTool, EditTool,
+                            CreatePlanTool, ImplementPlanTool,
+                        ]:
+                            registry.register(tool_cls)
                     for tool_cls in get_mcp_tools_for_agent(self.plugin, "main"):
                         registry.register(tool_cls)
                     tool_schemas = registry.get_all()
@@ -227,35 +258,17 @@ class CodingAgentChatter(BaseChatter):
                 # 流式推送到前端
                 chunk_count = 0
                 last_reasoning = ""
-                current_tool_call_id = ""
-                announced_tool_calls: set[str] = set()
+                reasoning_emitted = False
                 async for event in current.stream_events():
                     chunk = event.text_delta or ""
                     if chunk:
                         chunk_count += 1
                         await self._stream_to_frontend(session_id, chunk)
 
-                    if event.tool_call_id:
-                        current_tool_call_id = event.tool_call_id
-                    effective_tool_call_id = event.tool_call_id or current_tool_call_id
-                    if (
-                        event.tool_name
-                        and effective_tool_call_id
-                        and effective_tool_call_id not in announced_tool_calls
-                    ):
-                        announced_tool_calls.add(effective_tool_call_id)
-                        await session_mgr.broadcast_to_session(session_id, {
-                            "type": "tool.call",
-                            "payload": {
-                                "name": event.tool_name,
-                                "args_summary": "",
-                                "stage": "planning",
-                            },
-                        })
-
                     reasoning = current.reasoning_content or ""
                     if reasoning and reasoning != last_reasoning:
                         last_reasoning = reasoning
+                        reasoning_emitted = True
                         await self._stream_thinking_to_frontend(session_id, reasoning)
 
                 logger.debug(
@@ -280,7 +293,7 @@ class CodingAgentChatter(BaseChatter):
                 continue
 
             # 发送 thinking 内容（如有）
-            if current.reasoning_content:
+            if current.reasoning_content and not reasoning_emitted:
                 await self._stream_thinking_to_frontend(
                     session_id,
                     current.reasoning_content,
@@ -298,9 +311,22 @@ class CodingAgentChatter(BaseChatter):
                     final_content = rc[-500:] if len(rc) > 500 else rc
                 await session_mgr.broadcast_to_session(session_id, {
                     "type": "agent.text",
-                    "payload": {"content": final_content, "is_final": True},
+                    "payload": {
+                        "content": final_content,
+                        "is_final": True,
+                        "forkable": not self._is_goal_review_round,
+                    },
                 })
             else:
+                # 虽然有工具调用，但这一轮的文本流输出也已经结束，先给前端封口
+                await session_mgr.broadcast_to_session(session_id, {
+                    "type": "agent.text",
+                    "payload": {
+                        "content": current.message or "",
+                        "is_final": True,
+                        "forkable": False,
+                    },
+                })
                 # 有工具调用 → 处理工具调用（可能多轮）
                 try:
                     await self._notify_status("coding", "正在执行工具...")
@@ -315,7 +341,11 @@ class CodingAgentChatter(BaseChatter):
                             )
                         await session_mgr.broadcast_to_session(session_id, {
                             "type": "agent.text",
-                            "payload": {"content": current.message or "", "is_final": True},
+                            "payload": {
+                                "content": current.message or "",
+                                "is_final": True,
+                                "forkable": not self._is_goal_review_round,
+                            },
                         })
                 except Exception as e:
                     logger.error(f"工具调用后续处理失败: {e}", exc_info=True)
@@ -325,6 +355,7 @@ class CodingAgentChatter(BaseChatter):
                         "payload": {
                             "content": "\n当前回合已中止：工具调用后未能恢复到可见响应。你可以发送补充引导后重试。",
                             "is_final": True,
+                            "forkable": False,
                         },
                     })
                     current = self._current_request
@@ -332,10 +363,13 @@ class CodingAgentChatter(BaseChatter):
                     continue
 
             # 更新 current_request 指针（goal 审查轮不更新，保持正常对话指针）
+            payloads_data = self.export_clean_payloads_data(current)
+            session_mgr.cache_payloads_data(session_id, payloads_data)
             was_goal_review = self._is_goal_review_round
             self._is_goal_review_round = False
             if not was_goal_review:
                 self._current_request = current
+                self._record_final_agent_marker(session_id, payloads_data)
                 # 自动保存会话状态（fire-and-forget）
                 asyncio.create_task(self._auto_save(session_id))
 
@@ -371,6 +405,14 @@ class CodingAgentChatter(BaseChatter):
 
     # ── 自动保存 ───────────────────────────────────────────
 
+    async def _debounced_auto_save(self, session_id: str) -> None:
+        """防抖自动保存：距离上次保存不足 min_interval 秒则跳过。"""
+        now = time.time()
+        if now - self._last_auto_save_time < self._auto_save_min_interval:
+            return
+        self._last_auto_save_time = now
+        await self._auto_save(session_id)
+
     async def _auto_save(self, session_id: str) -> None:
         """异步保存当前会话状态到磁盘（fire-and-forget）。"""
         session_mgr = get_session_manager()
@@ -399,9 +441,91 @@ class CodingAgentChatter(BaseChatter):
                 project_context=session._resume_project_context,  # 显式传递
                 message_count=self._message_count,
                 linked_directories=session.linked_directories,
+                coder_payloads=session._coder_payloads_data,
             )
         except Exception:
-            logger.exception("自动保存会话失败")
+            logger.error("自动保存会话失败")
+
+    def export_clean_payloads_data(self, request: Any | None = None) -> list[dict]:
+        """导出当前请求的可持久化 payload 快照。"""
+        target = request or self._current_request
+        if target is None:
+            return []
+
+        clean_payloads = []
+        for payload in target.payloads:
+            if payload.role == ROLE.USER:
+                clean_content = self._strip_reminder_prefix(payload.content)
+                clean_payloads.append(LLMPayload(ROLE.USER, clean_content))
+            else:
+                clean_payloads.append(payload)
+        return [serialize_payload(payload) for payload in clean_payloads]
+
+    def get_message_count(self) -> int:
+        """暴露当前 chatter 已处理的用户消息计数。"""
+        return self._message_count
+
+    async def restore_from_payloads_data(
+        self,
+        payloads_data: list[dict[str, Any]],
+        message_count: int,
+    ) -> None:
+        """将活跃 Chatter 重建到指定 payload 边界。"""
+        session = get_session_manager().get_session_by_stream_id(self.stream_id)
+        project_context = session._resume_project_context if session else None
+
+        if session and session.solo_mode:
+            current, _ = self._build_solo_request(project_context)
+        else:
+            current, _ = self._build_clean_request(project_context)
+
+        history_count = 0
+        for pdata in payloads_data:
+            if pdata.get("role") in ("system", "tool"):
+                continue
+            restored = deserialize_payload(pdata)
+            current.add_payload(restored)
+            if pdata.get("role") == "user":
+                history_count += 1
+
+        self._current_request = current
+        self._message_count = max(int(message_count), 0) if message_count >= 0 else history_count
+        self._is_first_message = self._message_count == 0
+        self._goal_review_pending = False
+        self._is_goal_review_round = False
+        self._goal_round_modified = False
+        self._last_trigger_msgs = []
+
+    def _record_final_agent_marker(
+        self,
+        session_id: str,
+        payloads_data: list[dict[str, Any]],
+    ) -> None:
+        """为当前轮的最终 agent 文本记录 fork 边界。"""
+        session_mgr = get_session_manager()
+        session = session_mgr.get_session(session_id)
+        if session is None:
+            return
+
+        anchor_message_id = session.last_completed_agent_message_ids.get("agent", "")
+        if not anchor_message_id:
+            return
+
+        checkpoint_count = 0
+        if session.checkpoint_manager:
+            checkpoint_count = len(session.checkpoint_manager._checkpoints)
+
+        session_mgr.record_conversation_marker(
+            session_id,
+            anchor_message_id=anchor_message_id,
+            kind="after_agent_message",
+            payload_count=len(payloads_data),
+            timeline_count=len(session.timeline_events),
+            checkpoint_count=checkpoint_count,
+            message_count=self._message_count,
+            title=session._title,
+            usage_total=session.usage_total,
+        )
 
     def _strip_reminder_prefix(self, content: list) -> list:
         """从 content 列表中移除 <system_reminder>...</system_reminder> 的 Text 块。
@@ -459,7 +583,7 @@ class CodingAgentChatter(BaseChatter):
                 await session_mgr.update_session_title(session_id, title)
                 logger.info(f"会话 {session_id[:8]} 标题已生成: {title!r}")
         except Exception:
-            logger.exception("生成会话标题失败")
+            logger.error("生成会话标题失败")
 
     async def _run_project_research(self, project_root: str) -> dict:
         """执行完整的项目研究流程。
@@ -606,7 +730,48 @@ class CodingAgentChatter(BaseChatter):
 
         return request, registry
 
-    def _build_system_prompt(self) -> str:
+    def _build_solo_request(self, project_context: dict | None) -> tuple[LLMRequest, ToolRegistry]:
+        """构建 Solo 模式的请求：单一 agent 完成所有工作，不注册 create_plan 和 implement_plan。"""
+        session_mgr = get_session_manager()
+        session = session_mgr.get_session_by_stream_id(self.stream_id)
+
+        # 确定使用的 task 名
+        task_name = session.solo_model if session and session.solo_model else "coding_main"
+
+        # 构建请求，使用 code_main_agent reminder 桶
+        request = self.create_request(
+            task=task_name,
+            request_name="coding_solo",
+            with_reminder="code_main_agent",
+        )
+
+        # 替换为编程场景专用的上下文压缩处理器
+        request.context_manager.context_compression_handler = (
+            coding_context_compression_handler
+        )
+
+        # 填充人格信息（solo 模式）
+        system_prompt = self._build_system_prompt(solo_mode=True)
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
+
+        # 注入工具（与 Coder Agent 一致：Bash/Read/Write/Edit + MCP）
+        registry = ToolRegistry()
+        for tool_cls in [
+            BashTool, ReadTool, WriteTool, EditTool,
+        ]:
+            registry.register(tool_cls)
+
+        # 注入 MCP 工具（main Agent）
+        for tool_cls in get_mcp_tools_for_agent(self.plugin, "main"):
+            registry.register(tool_cls)
+
+        tool_schemas = registry.get_all()
+        if tool_schemas:
+            request.add_payload(LLMPayload(ROLE.TOOL, tool_schemas))  # type: ignore[arg-type]
+
+        return request, registry
+
+    def _build_system_prompt(self, solo_mode: bool = False) -> str:
         """构建填充了人格信息的 system prompt。"""
         try:
             from src.core.config import get_core_config
@@ -631,7 +796,8 @@ class CodingAgentChatter(BaseChatter):
             cast(CodingAgentConfig | None, getattr(self.plugin, "config", None))
         )
 
-        prompt = render_prompt(MAIN_AGENT_SYSTEM_PROMPT,
+        template = SOLO_AGENT_SYSTEM_PROMPT if solo_mode else MAIN_AGENT_SYSTEM_PROMPT
+        prompt = render_prompt(template,
             terminal_environment=terminal_environment,
             nickname=nickname or "Coding Agent",
             alias_names=alias_names or nickname or "Coding Agent",
@@ -642,9 +808,12 @@ class CodingAgentChatter(BaseChatter):
             background_story=background_story or "",
         )
 
-        # 注入 Coder 模型 Profile 列表
-        coder_profiles_text = self._get_coder_profiles_text()
-        prompt = prompt.replace("[[coder_model_profiles]]", coder_profiles_text)
+        # 注入 Coder 模型 Profile 列表（solo 模式不需要）
+        if solo_mode:
+            prompt = prompt.replace("[[coder_model_profiles]]", "")
+        else:
+            coder_profiles_text = self._get_coder_profiles_text()
+            prompt = prompt.replace("[[coder_model_profiles]]", coder_profiles_text)
 
         return prompt
 
@@ -674,9 +843,15 @@ class CodingAgentChatter(BaseChatter):
         与普通交互循环不同，这里会在每轮工具执行后主动拉取未读消息，
         将工作中追加的引导消息注入到下一轮请求，避免用户补充信息要等到整轮结束。
         """
+        session_mgr = get_session_manager()
         trigger_msg = trigger_msgs[-1] if trigger_msgs else None
         silent_tool_rounds = 0
         round_num = 0
+        task_observer = (
+            session_mgr.build_runtime_task_observer(session_id)
+            if session_id
+            else None
+        )
 
         while True:
             calls = response.call_list
@@ -687,7 +862,6 @@ class CodingAgentChatter(BaseChatter):
             logger.debug(f"工具调用轮次 {round_num}: {len(calls)} 个调用")
 
             # 通知前端即将执行的工具调用
-            session_mgr = get_session_manager()
             for call in calls:
                 # goal 审查轮：检测修改性工具
                 if self._is_goal_review_round and call.name in (
@@ -697,10 +871,13 @@ class CodingAgentChatter(BaseChatter):
                 await session_mgr.broadcast_to_session(session_id, {
                     "type": "tool.call",
                     "payload": {
+                        "call_id": getattr(call, "id", ""),
                         "name": call.name,
                         "args_summary": self._summarize_args(
                             call.args if hasattr(call, "args") else {}
                         ),
+                        "args": call.args if hasattr(call, "args") else {},
+                        "reason": self._get_tool_reason(registry, call.name),
                         "stage": "running",
                     },
                 })
@@ -711,7 +888,13 @@ class CodingAgentChatter(BaseChatter):
             )
             try:
                 # 执行工具，结果会写入 response 的 TOOL_RESULT payload
-                await self.run_tool_call(calls, response, registry, trigger_msg)
+                await self.run_tool_call(
+                    calls,
+                    response,
+                    registry,
+                    trigger_msg,
+                    task_observer=task_observer,
+                )
             finally:
                 forward_task.cancel()
                 try:
@@ -750,6 +933,7 @@ class CodingAgentChatter(BaseChatter):
             # 流式推送
             chunk_count = 0
             last_reasoning = ""
+            reasoning_emitted = False
             try:
                 async for event in response.stream_events():
                     chunk = event.text_delta or ""
@@ -760,6 +944,7 @@ class CodingAgentChatter(BaseChatter):
                     reasoning = response.reasoning_content or ""
                     if reasoning and reasoning != last_reasoning:
                         last_reasoning = reasoning
+                        reasoning_emitted = True
                         await self._stream_thinking_to_frontend(session_id, reasoning)
             except Exception as e:
                 logger.error(f"LLM 流式响应中断 (round={round_num}): {e}")
@@ -776,7 +961,7 @@ class CodingAgentChatter(BaseChatter):
                 break
 
             # 发送后续轮次的 thinking 内容（如有）
-            if response.reasoning_content:
+            if response.reasoning_content and not reasoning_emitted:
                 await self._stream_thinking_to_frontend(
                     session_id,
                     response.reasoning_content,
@@ -798,10 +983,9 @@ class CodingAgentChatter(BaseChatter):
                     "coding",
                     f"工具第 {round_num} 轮完成，但模型未返回可见文本，正在继续执行后续工具...",
                 )
-                if silent_tool_rounds >= self._MAX_SILENT_TOOL_ROUNDS:
-                    raise RuntimeError(
-                        "模型连续多轮仅请求工具且未返回可见文本/思考，已中止当前回合"
-                    )
+
+            # 每轮工具调用后触发防抖自动保存
+            await self._debounced_auto_save(session_id)
 
             if not response.call_list:
                 break
@@ -834,8 +1018,8 @@ class CodingAgentChatter(BaseChatter):
     async def _push_context_usage(self, session_id: str, current: Any) -> None:
         """推送 LLM 上下文用量到前端。
 
-        从 current._usage 提取 total_tokens，从 current.model_set 提取 max_context。
-        如果 _usage 为 None（某些模型不返回），则不发送消息。
+        从 current._usage 提取本次请求的 token 统计，累加到 session.usage_total，
+        然后发送会话累计值给前端。使用 fire-and-forget 持久化策略。
         """
         usage = getattr(current, "_usage", None)
         if not usage:
@@ -848,30 +1032,72 @@ class CodingAgentChatter(BaseChatter):
         # 从 model_set 获取 max_context（上下文窗口大小）和模型标识
         max_context = 0
         model_name = ""
-        cost = 0.0
+        model_entry = None
         model_set = getattr(current, "model_set", None)
         if model_set and isinstance(model_set, list) and len(model_set) > 0:
             model_entry = model_set[0]
             if isinstance(model_entry, dict):
                 max_context = model_entry.get("max_context", 0)
                 model_name = model_entry.get("model_identifier", "")
-                try:
-                    from src.kernel.llm.observation import calculate_request_cost
-                    cost = calculate_request_cost(model=model_entry, usage=usage)
-                except Exception:
-                    pass
 
-        await get_session_manager().broadcast_to_session(session_id, {
+        if not model_name:
+            return
+
+        # 计算本次请求的 cost
+        request_cost = 0.0
+        if model_entry and isinstance(model_entry, dict):
+            try:
+                from src.kernel.llm.observation import calculate_request_cost
+                request_cost = calculate_request_cost(model=model_entry, usage=usage)
+            except Exception:
+                pass
+
+        # 累加到 session.usage_total
+        session_mgr = get_session_manager()
+        session = session_mgr.get_session(session_id)
+        if session is None:
+            return
+
+        if model_name not in session.usage_total:
+            session.usage_total[model_name] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cache_hit_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "cost": 0.0,
+                "request_count": 0,
+            }
+
+        model_usage = session.usage_total[model_name]
+        model_usage["prompt_tokens"] = model_usage.get("prompt_tokens", 0) + int(usage.get("prompt_tokens", 0) or 0)
+        model_usage["completion_tokens"] = model_usage.get("completion_tokens", 0) + int(usage.get("completion_tokens", 0) or 0)
+        model_usage["cache_hit_tokens"] = model_usage.get("cache_hit_tokens", 0) + int(usage.get("cache_hit_tokens", 0) or 0)
+        model_usage["cache_write_tokens"] = model_usage.get("cache_write_tokens", 0) + int(usage.get("cache_write_tokens", 0) or 0)
+        model_usage["reasoning_tokens"] = model_usage.get("reasoning_tokens", 0) + int(usage.get("reasoning_tokens", 0) or 0)
+        model_usage["cost"] = model_usage.get("cost", 0.0) + request_cost
+        model_usage["request_count"] = model_usage.get("request_count", 0) + 1
+
+        # fire-and-forget 持久化（不阻塞主流程），避免覆盖已保存的 payloads / timeline
+        if session.session_store:
+            asyncio.ensure_future(session_mgr.persist_session_metadata(session_id))
+
+        # 发送会话累计用量（而非单次值）
+        await session_mgr.broadcast_to_session(session_id, {
             "type": "agent.context_usage",
             "payload": {
+                "is_cumulative": True,
                 "total_tokens": total_tokens,
                 "max_context": max_context,
                 "source": "agent",
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "cache_hit_tokens": usage.get("cache_hit_tokens", 0),
                 "model_name": model_name,
-                "cost": cost,
+                "prompt_tokens": model_usage["prompt_tokens"],
+                "completion_tokens": model_usage["completion_tokens"],
+                "cache_hit_tokens": model_usage["cache_hit_tokens"],
+                "cache_write_tokens": model_usage["cache_write_tokens"],
+                "reasoning_tokens": model_usage["reasoning_tokens"],
+                "cost": model_usage["cost"],
+                "request_count": model_usage["request_count"],
             },
         })
 
@@ -879,29 +1105,39 @@ class CodingAgentChatter(BaseChatter):
         """推送 agent.status 消息到前端。"""
         session = get_session_manager().get_session_by_stream_id(self.stream_id)
         if session:
+            session.phase = phase
             await get_session_manager().broadcast_to_session(session.id, {
                 "type": "agent.status",
                 "payload": {"phase": phase, "detail": detail, "source": "agent"},
             })
 
     @staticmethod
-    def _build_goal_review_prompt(goal_text: str) -> str:
+    def _build_goal_review_prompt(goal_text: str, goal_doc_path: str = "") -> str:
         """构建目标审查 prompt。"""
         return (
             "<system_reminder>\n"
-            "用户已经离线，你正在目标模式下工作。目标：" + goal_text + "\n\n"
-            "请完全不要依赖任何前文上下文和历史对话，"
-            "以全新的视角重新客观、严格地审视用户目标与当前实现的差距。"
-            "找出任何尚未满足目标要求之处，或可进一步优化的地方，并立即修改完善。\n\n"
-            "如果经过彻底审查后确实没有任何需要改动之处，"
-            "请仅输出 GOAL COMPLETE，不要输出任何其他内容。\n\n"
-            "重要规则：如果本轮你修改了任何文件、执行了任何代码变更，"
-            "则绝对不能输出 GOAL COMPLETE。必须先进入下一轮审查，"
-            "\n"
-            "警告：退出 goal 模式必须十分谨慎，这会导致迭代循环停止，可能导致交付质量不够。"
-            "因此在当你想要退出 goal 模式时，请务必首先思考有没有任何你没考虑到的可能性，"
-            "以及现在的实现是否已经无可挑剔了。\n"
-            "此消息将反复出现直到目标完成或者用户发送新的消息。"
+            "用户已离线，你正在目标模式下自主工作。目标：" + goal_text + "\n\n"
+            "**核心规则**：\n"
+            "1. 用户不在线，**绝对不要**征求用户意见、等待确认或询问任何问题。\n"
+            "   所有决策由你自己做出，选择最合理的方案直接执行。\n"
+            "2. 先使用 read 工具通读 GOAL 上下文文档（" + goal_doc_path + "），\n"
+            "   了解之前已完成的工作和注意事项，再开始审查。\n"
+            "3. 通读相关代码，对照目标逐条核查是否已完全达成。\n\n"
+            "**GOAL COMPLETE 输出标准**：\n"
+            "只有同时满足以下全部条件时，才能输出 GOAL COMPLETE：\n"
+            "- 已通读所有相关代码\n"
+            "- 已阅读 GOAL 上下文文档\n"
+            "- 对照目标逐条确认，目标已 100% 达成\n"
+            "- 没有任何可以进一步优化的空间\n\n"
+            "如果目标尚未完全达成或有优化空间：\n"
+            "1. 使用 write/edit/bash 等工具修改代码\n"
+            "2. 修改完成后，将本轮变更摘要写入 GOAL 上下文文档（" + goal_doc_path + "）\n"
+            "3. **如果你在本轮修改了任何文件，绝对不能输出 GOAL COMPLETE**\n"
+            "   必须先进入下一轮审查\n\n"
+            "如果确认目标已完全达成且无优化空间，请仅输出 GOAL COMPLETE，\n"
+            "不要输出任何其他内容。\n\n"
+            "此消息将反复出现直到目标完成或者用户发送新消息。\n"
+            "不要试图提前结束 goal 模式——这会导致迭代停止、交付质量不足。\n"
             "</system_reminder>"
         )
 
@@ -943,3 +1179,19 @@ class CodingAgentChatter(BaseChatter):
         if len(summary) > 120:
             summary = summary[:117] + "..."
         return summary
+
+    @staticmethod
+    def _get_tool_reason(registry: ToolRegistry, tool_name: str) -> str:
+        """从工具注册表中获取工具的 description 作为 reason。"""
+        try:
+            tool_cls = registry.get(tool_name)
+            if tool_cls is not None:
+                schema = tool_cls.to_schema()
+                # OpenAI 格式：{"type": "function", "function": {"description": "..."}}
+                if "function" in schema:
+                    return schema["function"].get("description", "")
+                # 直接格式：{"description": "..."}
+                return schema.get("description", "")
+        except Exception:
+            pass
+        return ""

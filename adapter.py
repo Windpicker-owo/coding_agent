@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+import re
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -26,6 +29,7 @@ from src.app.plugin_system.api import service_api
 from src.kernel.logger import get_logger
 
 from .session_manager import get_session_manager
+from .session_store import strip_display_prefixes
 
 logger = get_logger("coding_agent.adapter")
 
@@ -174,11 +178,92 @@ class CodingAgentAdapter(BaseAdapter):
         msg_type = raw.get("type", "")
         session_mgr = get_session_manager()
 
+        # ── 打开项目 ──
+        if msg_type == "project.open":
+            payload = raw.get("payload", {})
+            working_directory = payload.get("working_directory", ".")
+            
+            # 清理旧会话
+            old_session_id = self._conn_sessions.get(conn_id)
+            if old_session_id:
+                await session_mgr.destroy_session(old_session_id)
+                self._session_ws.pop(old_session_id, None)
+                self._conn_sessions.pop(conn_id, None)
+
+            summaries = await session_mgr.list_sessions(working_directory)
+            project_name = working_directory.rstrip("/\\").split("/")[-1] or working_directory.rstrip("/\\").split("\\")[-1]
+            
+            ws = self._connections.get(conn_id)
+            if ws:
+                msg = {
+                    "type": "project.opened",
+                    "payload": {
+                        "working_directory": working_directory,
+                        "project_name": project_name,
+                        "sessions": [
+                            {
+                                "session_id": s.session_id,
+                                "title": s.title,
+                                "created_at": s.created_at,
+                                "last_active_at": s.last_active_at,
+                                "message_count": s.message_count,
+                                "phase": s.phase,
+                            }
+                            for s in summaries
+                        ]
+                    }
+                }
+                await ws.send(json.dumps(msg, ensure_ascii=False))
+            return
+
+        # ── 目录浏览 ──
+        if msg_type == "browse.directory":
+            payload = raw.get("payload", {})
+            browse_path = Path(payload.get("path", "/"))
+
+            ws = self._connections.get(conn_id)
+            if not ws:
+                return
+
+            try:
+                resolved = browse_path.resolve()
+                parent = str(resolved.parent) if resolved.parent != resolved else None
+                entries = []
+                if resolved.is_dir():
+                    for entry in sorted(resolved.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+                        entries.append({
+                            "name": entry.name,
+                            "is_dir": entry.is_dir(),
+                        })
+                msg = {
+                    "type": "browse.directory_result",
+                    "payload": {
+                        "path": str(resolved),
+                        "parent": parent,
+                        "entries": entries,
+                    },
+                }
+            except (OSError, PermissionError, ValueError) as exc:
+                msg = {
+                    "type": "browse.directory_result",
+                    "payload": {
+                        "path": str(browse_path),
+                        "parent": None,
+                        "entries": [],
+                        "error": str(exc),
+                    },
+                }
+
+            await ws.send(json.dumps(msg, ensure_ascii=False))
+            return
+
         # ── 会话初始化 ──
         if msg_type == "session.init":
             payload = raw.get("payload", {})
             working_directory = payload.get("working_directory", ".")
             session_id = payload.get("session_id", "")
+            solo_mode = payload.get("solo_mode", False)
+            solo_model = payload.get("solo_model", "")
 
             # 清理旧会话（/new 或重新 init 时避免孤儿会话）
             old_session_id = self._conn_sessions.get(conn_id)
@@ -208,50 +293,17 @@ class CodingAgentAdapter(BaseAdapter):
                 )
                 resume_warning = ""
 
+            # 设置 solo 模式参数
+            if solo_mode:
+                session.solo_mode = True
+                session.solo_model = solo_model
+
             self._conn_sessions[conn_id] = session.id
             self._session_ws[session.id] = self._connections[conn_id]
             session.websocket = self._connections[conn_id]
 
             # 构建 session.ready 事件
-            ready_payload = {
-                "session_id": session.id,
-                "project_name": (
-                    working_directory.rstrip("/\\").split("/")[-1]
-                    or working_directory.rstrip("/\\").split("\\")[-1]
-                ),
-                "title": session._title or "",
-            }
-
-            # 如果是恢复模式，添加历史消息和目录不匹配警告
-            if session_id and session._resume_payloads is not None:
-                history = []
-                for pdata in session._resume_payloads:
-                    role = pdata.get("role", "")
-                    content_items = pdata.get("content", [])
-                    
-                    # 提取文本内容
-                    text_parts = []
-                    for item in content_items:
-                        if item.get("__type__") == "Text":
-                            text_parts.append(item.get("text", ""))
-                    
-                    if text_parts:
-                        text_content = "\n".join(text_parts)
-                        history.append({
-                            "role": role,
-                            "content": text_content,
-                        })
-                
-                ready_payload["history"] = history
-
-            # 如果有 working_directory 不匹配警告，加入 payload
-            if resume_warning:
-                ready_payload["working_directory_mismatch"] = resume_warning
-
-            await session_mgr.broadcast_to_session(session.id, {
-                "type": "session.ready",
-                "payload": ready_payload,
-            })
+            await self._broadcast_session_ready(session.id, resume_warning=resume_warning)
             return
 
         # ── 需要会话上下文的消息 ──
@@ -264,9 +316,80 @@ class CodingAgentAdapter(BaseAdapter):
             return
 
         if msg_type == "user.message":
+            session_mgr.reset_interrupt(session.id)
             # 转为 MessageEnvelope 送入标准管线
             envelope = await self._build_user_envelope(raw, session_id=session.id)
             if envelope:
+                payload = raw.get("payload", {})
+                content = payload.get("content", "")
+                kind = str(payload.get("kind", "message") or "message")
+                client_message_id = str(raw.get("id", "") or "")
+
+                live_state = self._get_live_chatter_state(session)
+                payload_snapshot = live_state.get("payloads")
+                payload_source = payload_snapshot or session.payloads_data or session._resume_payloads or []
+                payload_count_before = len(payload_source)
+                message_count_before = int(
+                    live_state.get(
+                        "message_count",
+                        sum(1 for item in payload_source if item.get("role") == "user"),
+                    ) or 0
+                )
+                timeline_count_before = len(session.timeline_events)
+
+                checkpoint = None
+                if session.checkpoint_manager:
+                    checkpoint = await session.checkpoint_manager.snapshot_before_user_message(
+                        str(content or ""),
+                    )
+
+                user_event = session_mgr.record_user_message(
+                    session.id,
+                    content,
+                    kind=kind,
+                    metadata={
+                        "client_message_id": client_message_id,
+                        "checkpoint_id": checkpoint.id if checkpoint else "",
+                        "revocable": checkpoint is not None,
+                    },
+                )
+                if user_event and checkpoint:
+                    session_mgr.record_conversation_marker(
+                        session.id,
+                        anchor_message_id=str(user_event.get("id", "") or ""),
+                        kind="before_user_message",
+                        payload_count=payload_count_before,
+                        timeline_count=timeline_count_before,
+                        checkpoint_count=max(
+                            len(session.checkpoint_manager._checkpoints) - 1,
+                            0,
+                        ),
+                        message_count=message_count_before,
+                        checkpoint_id=checkpoint.id,
+                        title=session._title,
+                        usage_total=session.usage_total,
+                    )
+                if user_event:
+                    await session_mgr.broadcast_to_session(session.id, {
+                        "type": "user.message_recorded",
+                        "payload": {
+                            "client_message_id": client_message_id,
+                            "message_id": user_event.get("id", ""),
+                            "checkpoint_id": checkpoint.id if checkpoint else "",
+                        },
+                    })
+                if checkpoint:
+                    await session_mgr.broadcast_to_session(session.id, {
+                        "type": "checkpoint.created",
+                        "payload": {
+                            "id": checkpoint.id,
+                            "step": checkpoint.step_index,
+                            "tool": checkpoint.tool_name,
+                            "description": checkpoint.description,
+                            "files_affected": len(checkpoint.file_snapshots),
+                            "reversible": checkpoint.is_reversible,
+                        },
+                    })
                 # 预计算 stream_id 并绑定到 session（与 distributor 使用相同逻辑）
                 from src.core.transport.message_receive.utils import extract_stream_id
                 stream_id = extract_stream_id(envelope["message_info"])
@@ -315,10 +438,16 @@ class CodingAgentAdapter(BaseAdapter):
             )
 
         elif msg_type == "user.interrupt":
-            await session_mgr.broadcast_to_session(session_id, {
-                "type": "agent.status",
-                "payload": {"phase": "ready", "detail": "操作已中断", "source": "agent"},
-            })
+            if session.phase != "ready":
+                await session_mgr.broadcast_to_session(session_id, {
+                    "type": "agent.status",
+                    "payload": {
+                        "phase": session.phase or "coding",
+                        "detail": "正在中断当前操作...",
+                        "source": "agent",
+                    },
+                })
+            await session_mgr.interrupt_session(session_id, detail="操作已中断")
 
         elif msg_type == "auto_review.toggle":
             session.auto_review_enabled = raw.get("payload", {}).get("enabled", False)
@@ -326,13 +455,43 @@ class CodingAgentAdapter(BaseAdapter):
         elif msg_type == "yolo.toggle":
             session.yolo_mode = raw.get("payload", {}).get("enabled", False)
 
+        elif msg_type == "solo.toggle":
+            session.solo_mode = raw.get("payload", {}).get("enabled", False)
+
         elif msg_type == "goal.set":
             session.goal_mode = True
             session.goal_text = raw.get("payload", {}).get("text", "")
+
+            # ── 创建 GOAL 上下文文档 ──
+            project_root = Path(session.working_directory)
+            # 取 goal_text 前 30 字符，非字母数字/中文替换为 -
+            prefix = session.goal_text[:30]
+            sanitized_prefix = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]', '-', prefix).strip('-')
+            if not sanitized_prefix:
+                sanitized_prefix = "goal"
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            doc_filename = f"GOAL-{sanitized_prefix}-{timestamp}.md"
+            agents_context_dir = project_root / ".agents" / "context"
+            agents_context_dir.mkdir(parents=True, exist_ok=True)
+            doc_path = agents_context_dir / doc_filename
+            doc_content = (
+                f"# Goal: {session.goal_text}\n\n"
+                f"> Started: {timestamp}\n\n"
+                f"## Progress Log\n\n"
+                f"（agent 每次修改代码后在此记录变更内容）\n\n"
+                f"## Notes & Warnings\n\n"
+                f"（agent 记录需要注意的事项、遗留问题等）\n"
+            )
+            doc_path.write_text(doc_content, encoding="utf-8")
+            session.goal_doc_path = str(doc_path)
+
             # 将目标作为 user message 注入管线
             content = (
-                f"你已进入目标模式，用户已经离线，你需要自主完成以下目标：\n\n"
-                f"{session.goal_text}\n\n"
+                f"你已进入目标模式。用户已离线，你需要完全自主完成以下目标，\n"
+                f"**绝对不要**征求用户意见、等待用户确认或询问用户任何问题。\n"
+                f"遇到需要决策的地方，直接选择最合理的方案并执行。\n\n"
+                f"目标：{session.goal_text}\n\n"
+                f"请在 GOAL 上下文文档（{session.goal_doc_path}）中记录你的进展和注意事项。\n"
                 f"请立即开始分析目标并制定实施计划。"
             )
             envelope = await self._build_user_envelope(
@@ -353,6 +512,12 @@ class CodingAgentAdapter(BaseAdapter):
 
         elif msg_type == "session.link":
             await self._handle_link(session, raw.get("payload", {}))
+
+        elif msg_type == "session.undo_user_message":
+            await self._handle_undo_user_message(session, raw.get("payload", {}))
+
+        elif msg_type == "session.fork":
+            await self._handle_fork(conn_id, session, raw.get("payload", {}))
 
         elif msg_type == "session.close":
             # 前端主动关闭会话：清理连接映射和内存会话，保留磁盘数据
@@ -446,6 +611,102 @@ class CodingAgentAdapter(BaseAdapter):
             "type": "checkpoint.list_result",
             "payload": {"checkpoints": checkpoints},
         })
+
+    async def _handle_undo_user_message(self, session: Any, payload: dict) -> None:
+        if session.phase not in {"ready", "init", "error"}:
+            return
+
+        message_id = str(payload.get("message_id", "") or "")
+        if not message_id:
+            return
+
+        session_mgr = get_session_manager()
+        marker = session_mgr.get_conversation_marker(
+            session.id,
+            anchor_message_id=message_id,
+            kind="before_user_message",
+        )
+        if marker is None:
+            return
+
+        live_state = self._get_live_chatter_state(session)
+        payload_snapshot = live_state.get("payloads")
+        if payload_snapshot:
+            session_mgr.cache_payloads_data(session.id, payload_snapshot)
+
+        checkpoint_id = str(marker.get("checkpoint_id", "") or "")
+        if checkpoint_id and session.checkpoint_manager:
+            await session.checkpoint_manager.rollback_to(checkpoint_id)
+
+        restored = session_mgr.restore_conversation_to_marker(
+            session.id,
+            anchor_message_id=message_id,
+            kind="before_user_message",
+            payloads_override=payload_snapshot,
+        )
+        if restored is None:
+            return
+
+        await self._restore_live_chatter(
+            session,
+            payloads=restored["payloads"],
+            message_count=int(restored["message_count"]),
+        )
+        await session_mgr.save_session_state(
+            session.id,
+            payloads=restored["payloads"],
+            project_context=session._resume_project_context,
+            title=session._title,
+            message_count=int(restored["message_count"]),
+            linked_directories=session.linked_directories,
+            coder_payloads=session._coder_payloads_data,
+        )
+        await self._broadcast_session_ready(session.id)
+
+    async def _handle_fork(self, conn_id: str, session: Any, payload: dict) -> None:
+        if session.phase not in {"ready", "init", "error"}:
+            return
+
+        anchor_message_id = str(payload.get("anchor_message_id", "") or "")
+        if not anchor_message_id:
+            return
+
+        session_mgr = get_session_manager()
+        live_state = self._get_live_chatter_state(session)
+        payload_snapshot = live_state.get("payloads")
+        if payload_snapshot:
+            session_mgr.cache_payloads_data(session.id, payload_snapshot)
+
+        await session_mgr.save_session_state(
+            session.id,
+            payloads=session.payloads_data,
+            project_context=session._resume_project_context,
+            title=session._title,
+            linked_directories=session.linked_directories,
+            coder_payloads=session._coder_payloads_data,
+        )
+
+        forked = await session_mgr.fork_session_from_marker(
+            session.id,
+            conn_id=conn_id,
+            anchor_message_id=anchor_message_id,
+            payloads_override=payload_snapshot,
+        )
+        if forked is None:
+            return
+
+        old_session_id = session.id
+        ws = self._connections.get(conn_id)
+        if ws is not None:
+            session.websocket = None
+            forked.websocket = ws
+            self._session_ws.pop(old_session_id, None)
+            self._session_ws[forked.id] = ws
+        self._conn_sessions[conn_id] = forked.id
+
+        await session_mgr.destroy_session(old_session_id)
+        await self._broadcast_session_ready(forked.id)
+        await self._broadcast_session_list(forked.id, forked.working_directory)
 
     async def _handle_link(self, session: Any, payload: dict) -> None:
         """处理 session.link 消息，关联外部项目目录。"""
@@ -686,6 +947,153 @@ class CodingAgentAdapter(BaseAdapter):
             "bot_name": "Coding Agent",
             "platform": self.platform,
         }
+
+    async def _broadcast_session_ready(
+        self,
+        session_id: str,
+        *,
+        resume_warning: str = "",
+    ) -> None:
+        session_mgr = get_session_manager()
+        session = session_mgr.get_session(session_id)
+        if session is None:
+            return
+        await session_mgr.broadcast_to_session(session.id, {
+            "type": "session.ready",
+            "payload": self._build_session_ready_payload(
+                session,
+                resume_warning=resume_warning,
+            ),
+        })
+
+    async def _broadcast_session_list(
+        self,
+        session_id: str,
+        working_directory: str,
+    ) -> None:
+        session_mgr = get_session_manager()
+        summaries = await session_mgr.list_sessions(working_directory)
+        await session_mgr.broadcast_to_session(session_id, {
+            "type": "session.list_result",
+            "payload": {
+                "sessions": [
+                    {
+                        "session_id": s.session_id,
+                        "title": s.title,
+                        "created_at": s.created_at,
+                        "last_active_at": s.last_active_at,
+                        "message_count": s.message_count,
+                        "phase": s.phase,
+                    }
+                    for s in summaries
+                ],
+            },
+        })
+
+    @staticmethod
+    def _build_session_ready_payload(
+        session: Any,
+        *,
+        resume_warning: str = "",
+    ) -> dict[str, Any]:
+        ready_payload: dict[str, Any] = {
+            "session_id": session.id,
+            "project_name": (
+                session.working_directory.rstrip("/\\").split("/")[-1]
+                or session.working_directory.rstrip("/\\").split("\\")[-1]
+            ),
+            "working_directory": session.working_directory,
+            "title": session._title or "",
+            "solo_mode": session.solo_mode,
+            "auto_review_enabled": session.auto_review_enabled,
+            "yolo_mode": session.yolo_mode,
+            "checkpoints": (
+                session.checkpoint_manager.list_checkpoints()
+                if session.checkpoint_manager
+                else []
+            ),
+        }
+
+        if session.timeline_events:
+            ready_payload["timeline"] = deepcopy(session.timeline_events)
+            ready_payload["history"] = [
+                {
+                    "role": "assistant" if item.get("role") == "agent" else item.get("role", ""),
+                    "content": strip_display_prefixes(str(item.get("content", "") or "")),
+                }
+                for item in session.timeline_events
+                if item.get("role") in {"user", "agent"}
+                and str(item.get("content", "") or "").strip()
+            ]
+        elif session._resume_payloads is not None:
+            history = []
+            for pdata in session._resume_payloads:
+                role = pdata.get("role", "")
+                content_items = pdata.get("content", [])
+                text_parts = []
+                for item in content_items:
+                    if item.get("__type__") == "Text":
+                        clean_text = strip_display_prefixes(str(item.get("text", "") or ""))
+                        if clean_text:
+                            text_parts.append(clean_text)
+                if text_parts:
+                    history.append({
+                        "role": role,
+                        "content": "\n".join(text_parts),
+                    })
+            ready_payload["history"] = history
+
+        if resume_warning:
+            ready_payload["working_directory_mismatch"] = resume_warning
+
+        return ready_payload
+
+    @staticmethod
+    def _get_live_chatter_state(session: Any) -> dict[str, Any]:
+        if not getattr(session, "stream_id", ""):
+            return {}
+        try:
+            from src.app.plugin_system.api.chat_api import get_chatter_by_stream
+
+            chatter = get_chatter_by_stream(session.stream_id)
+            if chatter is None:
+                return {}
+
+            state: dict[str, Any] = {}
+            export_payloads = getattr(chatter, "export_clean_payloads_data", None)
+            if callable(export_payloads):
+                payloads = export_payloads()
+                if isinstance(payloads, list):
+                    state["payloads"] = payloads
+
+            get_message_count = getattr(chatter, "get_message_count", None)
+            if callable(get_message_count):
+                count = get_message_count()
+                if isinstance(count, int):
+                    state["message_count"] = count
+
+            return state
+        except Exception:
+            return {}
+
+    @staticmethod
+    async def _restore_live_chatter(
+        session: Any,
+        *,
+        payloads: list[dict[str, Any]],
+        message_count: int,
+    ) -> None:
+        if not getattr(session, "stream_id", ""):
+            return
+        try:
+            from src.app.plugin_system.api.chat_api import get_chatter_by_stream
+
+            chatter = get_chatter_by_stream(session.stream_id)
+            restore = getattr(chatter, "restore_from_payloads_data", None)
+            if callable(restore):
+                await restore(payloads, message_count)
+        except Exception:
+            logger.warning("恢复活跃 Chatter 状态失败", exc_info=True)
 
 
 # ── 模块级辅助函数（供 _handle_link 使用）─────────────────

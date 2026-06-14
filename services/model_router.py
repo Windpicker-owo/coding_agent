@@ -87,9 +87,8 @@ class ModelRouter:
         for name, profile in self._profiles.items():
             tags_str = ", ".join(profile.tags) if profile.tags else "通用"
             desc = profile.description or "无描述"
-            model_name = profile.model_name or "未知"
             entries.append(
-                f"- **{name}** (模型: `{model_name}`)\n"
+                f"- **{name}**\n"
                 f"  标签: {tags_str}\n"
                 f"  适用场景: {desc}"
             )

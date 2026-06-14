@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,12 +39,35 @@ class CodingToolMixin:
             return None
         return session.checkpoint_manager
 
+    def _get_staging_area(self) -> Any:
+        """获取当前会话的文件暂存区（FileStagingArea | None）。"""
+        session = self._get_current_session()
+        if session is None:
+            return None
+        return session.staging_area
+
+    def _observe_staging_path(self, path: Path) -> None:
+        """将显式访问的文件路径登记到暂存区追踪范围。"""
+        staging = self._get_staging_area()
+        if staging is None:
+            return
+        try:
+            staging.observe_path(str(path.resolve()))
+        except Exception:
+            return
+
     def _get_working_directory(self) -> str:
         """获取当前工作目录。"""
         session = self._get_current_session()
         if session and session.working_directory:
             return session.working_directory
         return str(Path.cwd())
+
+    def _ensure_not_interrupted(self) -> None:
+        """若会话已被中断，则立刻终止当前工具执行。"""
+        session = self._get_current_session()
+        if session is not None and session.interrupt_requested:
+            raise asyncio.CancelledError("会话已中断")
 
     def _resolve_path(self, path: str) -> Path:
         """解析路径：相对路径基于工作目录。"""
@@ -81,7 +105,7 @@ class CodingToolMixin:
         )
 
     async def _notify_file_change(
-        self, path: str, action: str, diff: str = ""
+        self, path: str, action: str, diff: str = "", content: str = ""
     ) -> None:
         """通过 WebSocket 通知前端文件变更。"""
         session = self._get_current_session()
@@ -90,7 +114,7 @@ class CodingToolMixin:
         mgr = self._get_session_manager()
         await mgr.broadcast_to_session(session.id, {
             "type": "file.change",
-            "payload": {"path": path, "action": action, "diff": diff},
+            "payload": {"path": path, "action": action, "diff": diff, "content": content},
         })
 
     async def _notify_checkpoint_created(self, checkpoint: Any) -> None:

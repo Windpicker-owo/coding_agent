@@ -1,6 +1,11 @@
-"""Coding Agent 服务组件。"""
+"""Coding Agent services package.
 
-from .model_router import ModelRouter
-from .project_context import ProjectContextService
+Keep package import side effects minimal; individual services should be
+imported from their concrete modules.
+"""
 
-__all__ = ["ModelRouter", "ProjectContextService"]
+__all__ = [
+    "FileStagingArea",
+    "ModelRouter",
+    "ProjectContextService",
+]

@@ -18,6 +18,28 @@ class FileSnapshot:
     original_content: bytes | None  # None 表示文件原本不存在
     original_mode: int | None
 
+    def to_dict(self) -> dict:
+        """序列化为可 JSON 化的字典。"""
+        import base64
+        return {
+            "path": self.path,
+            "action": self.action,
+            "original_content_b64": base64.b64encode(self.original_content).decode() if self.original_content else None,
+            "original_mode": self.original_mode,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> FileSnapshot:
+        """从字典反序列化。"""
+        import base64
+        content_b64 = data.get("original_content_b64")
+        return FileSnapshot(
+            path=data["path"],
+            action=data["action"],
+            original_content=base64.b64decode(content_b64) if content_b64 else None,
+            original_mode=data.get("original_mode"),
+        )
+
 
 @dataclass
 class Checkpoint:
@@ -31,6 +53,35 @@ class Checkpoint:
     agent_name: str
     is_reversible: bool
     bash_command: str | None = None
+
+    def to_dict(self) -> dict:
+        """序列化为可 JSON 化的字典。"""
+        return {
+            "id": self.id,
+            "step_index": self.step_index,
+            "tool_name": self.tool_name,
+            "description": self.description,
+            "file_snapshots": [s.to_dict() for s in self.file_snapshots],
+            "timestamp": self.timestamp,
+            "agent_name": self.agent_name,
+            "is_reversible": self.is_reversible,
+            "bash_command": self.bash_command,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> Checkpoint:
+        """从字典反序列化。"""
+        return Checkpoint(
+            id=data["id"],
+            step_index=data["step_index"],
+            tool_name=data["tool_name"],
+            description=data["description"],
+            file_snapshots=[FileSnapshot.from_dict(s) for s in data.get("file_snapshots", [])],
+            timestamp=data["timestamp"],
+            agent_name=data["agent_name"],
+            is_reversible=data["is_reversible"],
+            bash_command=data.get("bash_command"),
+        )
 
 
 @dataclass
@@ -140,6 +191,34 @@ class CheckpointManager:
             agent_name=agent_name,
             is_reversible=is_reversible,
             bash_command=command,
+        )
+        self._checkpoints.append(checkpoint)
+        return checkpoint
+
+    async def snapshot_before_user_message(
+        self,
+        content: str,
+        agent_name: str = "user",
+    ) -> Checkpoint:
+        """用户消息发送前创建逻辑检查点。
+
+        该检查点不直接保存文件快照，只作为“回到这条用户消息之前”
+        的锚点，供后续撤回用户消息时联动回滚后续改动。
+        """
+        self._step_counter += 1
+        summary = " ".join(str(content or "").strip().split())
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+
+        checkpoint = Checkpoint(
+            id=str(uuid4()),
+            step_index=self._step_counter,
+            tool_name="user_message",
+            description=f"用户消息: {summary or '(空消息)'}",
+            file_snapshots=[],
+            timestamp=time.time(),
+            agent_name=agent_name,
+            is_reversible=True,
         )
         self._checkpoints.append(checkpoint)
         return checkpoint
@@ -334,6 +413,18 @@ class CheckpointManager:
             }
             for cp in self._checkpoints
         ]
+
+    @classmethod
+    def from_checkpoint_dicts(
+        cls, session_id: str, working_directory: str, data: list[dict],
+    ) -> CheckpointManager:
+        """从持久化的 checkpoint 字典列表恢复。"""
+        mgr = cls(session_id, working_directory)
+        mgr._checkpoints = [Checkpoint.from_dict(d) for d in data]
+        mgr._step_counter = max(
+            (cp.step_index for cp in mgr._checkpoints), default=0,
+        )
+        return mgr
 
     @staticmethod
     def _is_readonly_command(command: str) -> bool:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,161 @@ from src.kernel.llm.payload.tooling import LLMUsable
 from src.kernel.llm.roles import ROLE
 
 # ── 序列化 / 反序列化 ──────────────────────────────────────────────
+
+_GUIDANCE_PREFIX = "【工作中追加引导】\n"
+_SYSTEM_REMINDER_PATTERN = re.compile(
+    r"<system_reminder>.*?</system_reminder>",
+    re.DOTALL | re.MULTILINE,
+)
+_MESSAGE_METADATA_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:【?\d{1,2}:\d{2}(?::\d{2})?】?\s*)?(?:<成员>|【成员】)\s*[^\n]*?[：:]\s*"
+)
+
+
+def _normalize_tool_name(name: str) -> str:
+    """去除常见工具名前缀，便于前端展示。"""
+    for prefix in ("tool-", "action-", "agent-"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _summarize_tool_args(args: Any) -> str:
+    """将工具参数序列化为简短摘要。"""
+    if not isinstance(args, dict) or not args:
+        return ""
+    parts: list[str] = []
+    for key, value in args.items():
+        value_text = str(value)
+        if len(value_text) > 60:
+            value_text = value_text[:57] + "..."
+        parts.append(f"{key}={value_text!r}")
+    summary = ", ".join(parts)
+    if len(summary) > 160:
+        summary = summary[:157] + "..."
+    return summary
+
+
+def strip_display_prefixes(text: str) -> str:
+    """移除仅用于运行时语义的显示前缀。"""
+    clean = str(text or "")
+    previous = None
+    while clean != previous:
+        previous = clean
+        clean = _MESSAGE_METADATA_PREFIX_PATTERN.sub("", clean, count=1)
+        if clean.startswith(_GUIDANCE_PREFIX):
+            clean = clean[len(_GUIDANCE_PREFIX):]
+        clean = _SYSTEM_REMINDER_PATTERN.sub("", clean)
+    return clean.strip()
+
+
+def build_timeline_from_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从旧版 payload 历史重建可恢复时间线。
+
+    旧 session 没有单独保存 frontend timeline，但 payloads 中仍包含用户消息、
+    assistant 文本以及 ToolCall/ToolResult，可用于回放基本对话轨迹。
+    """
+    timeline: list[dict[str, Any]] = []
+    now_ms = int(time.time() * 1000)
+
+    for payload_index, payload in enumerate(payloads):
+        role = str(payload.get("role", "") or "")
+        content_items = payload.get("content", [])
+        if not isinstance(content_items, list):
+            continue
+
+        for item_index, item in enumerate(content_items):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("__type__", "") or "")
+            event_id = f"legacy-{payload_index}-{item_index}"
+            timestamp = now_ms + payload_index * 100 + item_index
+
+            if role == "user" and item_type == "Text":
+                text = str(item.get("text", "") or "")
+                metadata: dict[str, Any] = {}
+                if text.startswith(_GUIDANCE_PREFIX):
+                    metadata["kind"] = "guidance"
+                text = strip_display_prefixes(text)
+                if text.strip():
+                    event = {
+                        "id": event_id,
+                        "role": "user",
+                        "content": text,
+                        "timestamp": timestamp,
+                    }
+                    if metadata:
+                        event["metadata"] = metadata
+                    timeline.append(event)
+                continue
+
+            if role == "assistant":
+                if item_type == "ReasoningText":
+                    text = str(item.get("text", "") or "")
+                    text = strip_display_prefixes(text)
+                    if text.strip():
+                        timeline.append({
+                            "id": event_id,
+                            "role": "system",
+                            "content": text,
+                            "timestamp": timestamp,
+                            "metadata": {
+                                "kind": "thinking",
+                                "source": "agent",
+                            },
+                        })
+                elif item_type == "Text":
+                    text = str(item.get("text", "") or "")
+                    text = strip_display_prefixes(text)
+                    if text.strip():
+                        timeline.append({
+                            "id": event_id,
+                            "role": "agent",
+                            "content": text,
+                            "timestamp": timestamp,
+                            "metadata": {"source": "agent"},
+                        })
+                elif item_type == "ToolCall":
+                    raw_name = str(item.get("name", "") or "")
+                    tool_name = _normalize_tool_name(raw_name)
+                    args = item.get("args", {})
+                    args_summary = _summarize_tool_args(args)
+                    timeline.append({
+                        "id": event_id,
+                        "role": "system",
+                        "content": args_summary or tool_name,
+                        "timestamp": timestamp,
+                        "metadata": {
+                            "kind": "tool_call",
+                            "tool_name": tool_name or raw_name or "unknown",
+                            "args": args if isinstance(args, dict) else {},
+                            "args_summary": args_summary,
+                            "stage": "completed",
+                            "source": "agent",
+                        },
+                    })
+                continue
+
+            if role == "tool_result" and item_type == "ToolResult":
+                value = str(item.get("value", "") or "")
+                raw_name = str(item.get("name", "") or "")
+                tool_name = _normalize_tool_name(raw_name)
+                metadata: dict[str, Any] = {
+                    "kind": "tool_result",
+                    "tool_name": tool_name or raw_name or "unknown",
+                }
+                if tool_name == "bash":
+                    metadata["kind"] = "bash_output"
+                    metadata["stream"] = "stdout"
+                timeline.append({
+                    "id": event_id,
+                    "role": "system",
+                    "content": value,
+                    "timestamp": timestamp,
+                    "metadata": metadata,
+                })
+
+    return timeline
 
 
 def serialize_content(content_item: Any) -> dict[str, Any]:
@@ -126,6 +282,15 @@ class SessionData:
     project_context: dict[str, Any] | None = None
     payloads: list[dict[str, Any]] = field(default_factory=list)
     linked_directories: list[str] = field(default_factory=list)  # 关联的外部项目目录
+    usage_total: dict[str, dict[str, Any]] = field(default_factory=dict)  # 按 model_name 累计用量
+    solo_mode: bool = False  # Solo 模式：单一 agent 完成所有工作
+    solo_model: str = ""  # Solo 模式使用的 LLM task 名
+    auto_review_enabled: bool = False  # 自动审查模式
+    yolo_mode: bool = False  # 免审批模式
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)  # 持久化的 checkpoint 数据
+    coder_payloads: list[dict[str, Any]] | None = None  # Coder Agent 执行中的中间状态
+    timeline: list[dict[str, Any]] = field(default_factory=list)  # 可恢复的前端消息时间线
+    conversation_markers: list[dict[str, Any]] = field(default_factory=list)  # 用户撤回 / fork 锚点
 
 
 @dataclass
@@ -174,6 +339,15 @@ class SessionStore:
                 "project_context": data.project_context,
                 "payloads": data.payloads,
                 "linked_directories": data.linked_directories,
+                "usage_total": data.usage_total,
+                "solo_mode": data.solo_mode,
+                "solo_model": data.solo_model,
+                "auto_review_enabled": data.auto_review_enabled,
+                "yolo_mode": data.yolo_mode,
+                "checkpoints": data.checkpoints,
+                "coder_payloads": data.coder_payloads,
+                "timeline": data.timeline,
+                "conversation_markers": data.conversation_markers,
             },
             indent=2,
             ensure_ascii=False,
@@ -219,6 +393,15 @@ class SessionStore:
             project_context=raw.get("project_context"),
             payloads=raw.get("payloads", []),
             linked_directories=raw.get("linked_directories", []),
+            usage_total=raw.get("usage_total", {}),
+            solo_mode=raw.get("solo_mode", False),
+            solo_model=raw.get("solo_model", ""),
+            auto_review_enabled=raw.get("auto_review_enabled", False),
+            yolo_mode=raw.get("yolo_mode", False),
+            checkpoints=raw.get("checkpoints", []),
+            coder_payloads=raw.get("coder_payloads"),
+            timeline=raw.get("timeline", []),
+            conversation_markers=raw.get("conversation_markers", []),
         )
 
     async def update_title(self, session_id: str, title: str) -> None:
@@ -253,7 +436,7 @@ class SessionStore:
             return []
 
         summaries: list[SessionSummary] = []
-        for f in sorted(self._sessions_dir.glob("*.json"), key=os.path.getmtime, reverse=True):
+        for f in self._sessions_dir.glob("*.json"):
             try:
                 raw = json.loads(f.read_text(encoding="utf-8"))
                 summaries.append(SessionSummary(
@@ -267,6 +450,7 @@ class SessionStore:
             except (json.JSONDecodeError, OSError):
                 continue
 
+        summaries.sort(key=lambda s: s.last_active_at, reverse=True)
         return summaries
 
     async def delete(self, session_id: str) -> None:

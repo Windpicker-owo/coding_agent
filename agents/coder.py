@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Annotated, Any
 
 from src.app.plugin_system.base import BaseAgent
@@ -35,6 +37,8 @@ class CoderAgent(BaseAgent):
     associated_types = ["text"]
     usables = [BashTool, ReadTool, WriteTool, EditTool]  # 可写工具
     _FRONTEND_SOURCE = "coder"
+    _AUTO_SAVE_MIN_INTERVAL: float = 3.0  # 防抖自动保存最小间隔秒数
+    _FINAL_GUIDANCE_GRACE_SECONDS: float = 0.35  # 收尾前短暂等待追加引导转发
 
     def _get_extra_usables(self) -> list[type[LLMUsable]]:
         """注入 MCP 工具（coder Agent）。"""
@@ -63,6 +67,11 @@ class CoderAgent(BaseAgent):
             return False, model_set
         session = get_session_manager().get_session_by_stream_id(self.stream_id)
         session_id = session.id if session else ""
+        task_observer = (
+            get_session_manager().build_runtime_task_observer(session_id)
+            if session_id
+            else None
+        )
 
         # 创建请求，通过 context_manager 注入 code_coder 槽位和压缩处理器
         context_manager = LLMContextManager(
@@ -97,92 +106,154 @@ class CoderAgent(BaseAgent):
 
         # 多轮工具调用循环
         await self._notify_status(session_id, "coding", "Coder 正在读取计划并开始实施...")
-        while True:
-            response = await request.send(stream=True)
 
-            last_reasoning = ""
-            current_tool_call_id = ""
-            announced_tool_calls: set[str] = set()
-            async for event in response.stream_events():
-                chunk = event.text_delta or ""
-                if chunk:
-                    await self._stream_to_frontend(session_id, chunk)
+        # 创建文件追踪暂存区：write/edit 会立即落到磁盘，但保留初始内容用于最终 diff / 回滚
+        from ..services.file_staging import FileStagingArea
+        staging = None
+        if session:
+            staging = FileStagingArea(
+                session.working_directory,
+                linked_directories=session.linked_directories,
+            )
+            session.staging_area = staging
 
-                if event.tool_call_id:
-                    current_tool_call_id = event.tool_call_id
-                effective_tool_call_id = event.tool_call_id or current_tool_call_id
-                if (
-                    event.tool_name
-                    and effective_tool_call_id
-                    and effective_tool_call_id not in announced_tool_calls
-                ):
-                    announced_tool_calls.add(effective_tool_call_id)
-                    await self._notify_tool_call(
+        try:
+            last_auto_save_time: float = 0.0
+            while True:
+                response = await request.send(stream=True)
+
+                last_reasoning = ""
+                reasoning_emitted = False
+                async for event in response.stream_events():
+                    chunk = event.text_delta or ""
+                    if chunk:
+                        await self._stream_to_frontend(session_id, chunk)
+
+                    reasoning = response.reasoning_content or ""
+                    if reasoning and reasoning != last_reasoning:
+                        last_reasoning = reasoning
+                        reasoning_emitted = True
+                        await self._stream_thinking_to_frontend(session_id, reasoning)
+
+                if response.reasoning_content and not reasoning_emitted:
+                    await self._stream_thinking_to_frontend(
                         session_id,
-                        event.tool_name,
-                        {},
-                        stage="planning",
+                        response.reasoning_content,
                     )
 
-                reasoning = response.reasoning_content or ""
-                if reasoning and reasoning != last_reasoning:
-                    last_reasoning = reasoning
-                    await self._stream_thinking_to_frontend(session_id, reasoning)
+                # 推送 coder 的上下文用量到前端
+                await self._push_context_usage(session_id, response)
 
-            if response.reasoning_content:
-                await self._stream_thinking_to_frontend(
-                    session_id,
-                    response.reasoning_content,
-                )
-
-            # 推送 coder 的上下文用量到前端
-            await self._push_context_usage(session_id, response)
-
-            if response.call_list:
-                await self._notify_status(session_id, "coding", "Coder 正在执行实现工具...")
-                for call in response.call_list:
-                    call_args = call.args if isinstance(call.args, dict) else {}
-                    await self._notify_tool_call(
-                        session_id,
-                        call.name,
-                        call_args,
-                        stage="running",
-                    )
-                    try:
-                        success, result = await self.execute_local_usable(
-                            call.name, **call_args
+                if response.call_list:
+                    # 在开始调用工具前，先终结当前轮次的文本流
+                    await self._stream_final(session_id)
+                    await self._notify_status(session_id, "coding", "Coder 正在执行工具...")
+                    for call in response.call_list:
+                        call_args = call.args if isinstance(call.args, dict) else {}
+                        await self._notify_tool_call(
+                            session_id,
+                            call.name,
+                            call_args,
+                            call_id=call.id,
+                            stage="running",
                         )
-                        result_str = str(result) if not isinstance(result, str) else result
-                        response.add_payload(LLMPayload(
-                            ROLE.TOOL_RESULT,
-                            ToolResult(value=result_str, call_id=call.id),
-                        ))
-                    except Exception as e:
-                        response.add_payload(LLMPayload(
-                            ROLE.TOOL_RESULT,
-                            ToolResult(value=f"错误: {e}", call_id=call.id),
-                        ))
-                # 工具轮次间检查 chatter 转发的 guidance 队列
-                if session and session.coder_guidance_queue:
-                    guidance_texts: list[str] = []
-                    while session.coder_guidance_queue:
-                        guidance_texts.append(session.coder_guidance_queue.pop(0))
-                    combined = "\n".join(guidance_texts)
-                    response.add_payload(LLMPayload(ROLE.USER, Text(combined)))
-                    await self._notify_status(session_id, "coding", "已接收引导消息")
+                        try:
+                            success, result = await self.execute_local_usable(
+                                call.name,
+                                task_observer=task_observer,
+                                **call_args,
+                            )
+                            result_str = str(result) if not isinstance(result, str) else result
+                            response.add_payload(LLMPayload(
+                                ROLE.TOOL_RESULT,
+                                ToolResult(value=result_str, call_id=call.id),
+                            ))
+                        except Exception as e:
+                            response.add_payload(LLMPayload(
+                                ROLE.TOOL_RESULT,
+                                ToolResult(value=f"错误: {e}", call_id=call.id),
+                            ))
+                    # 工具轮次间检查 chatter 转发的 guidance 队列
+                    await self._apply_pending_guidance(
+                        session,
+                        response,
+                        session_id,
+                        detail="已接收引导消息",
+                    )
 
-                request = response
-            else:
-                break
+                    request = response
 
-        message = getattr(response, "message", "") or ""
-        await self._stream_final(session_id)
-        return True, message
+                    # 防抖自动保存：将 Coder 的 payloads 序列化到 session，供 Main Agent 保存
+                    now = time.time()
+                    if now - last_auto_save_time >= self._AUTO_SAVE_MIN_INTERVAL:
+                        last_auto_save_time = now
+                        await self._save_coder_progress(session, request)
+                else:
+                    # 给 guidance 转发后台任务留一个极短窗口，避免“最后一刻发来的引导”丢在收尾阶段
+                    if session is not None:
+                        await asyncio.sleep(self._FINAL_GUIDANCE_GRACE_SECONDS)
+                    has_late_guidance = await self._apply_pending_guidance(
+                        session,
+                        response,
+                        session_id,
+                        detail="已接收新的引导消息，正在继续调整结果...",
+                    )
+                    if has_late_guidance:
+                        await self._stream_final(session_id)
+                        request = response
+                        now = time.time()
+                        if now - last_auto_save_time >= self._AUTO_SAVE_MIN_INTERVAL:
+                            last_auto_save_time = now
+                            await self._save_coder_progress(session, request)
+                        continue
+                    break
+
+            # Coder 成功完成：commit 暂存区变更到磁盘
+            commit_result = None
+            if staging:
+                commit_result = await staging.commit()
+
+            # 清除中间状态
+            if session:
+                session._coder_payloads_data = None
+                session.staging_area = None
+
+            message = getattr(response, "message", "") or ""
+            await self._stream_final(session_id)
+
+            # 返回结果包含文件列表与整体 diff，供 Main Agent 继续总结/汇报
+            if commit_result and commit_result.files_changed:
+                sections: list[str] = []
+                if message.strip():
+                    sections.append(message.strip())
+                if commit_result.summary.strip():
+                    sections.append(f"## 变更摘要\n{commit_result.summary.strip()}")
+                if commit_result.combined_diff.strip():
+                    sections.append(
+                        "## 总体 Diff\n```diff\n"
+                        f"{commit_result.combined_diff.strip()}\n"
+                        "```"
+                    )
+                return True, "\n\n".join(section for section in sections if section.strip())
+            return True, message
+
+        except BaseException:
+            # Coder 失败/异常/取消：rollback 暂存区，不留半成品
+            if staging:
+                staging.rollback()
+            if session:
+                session.staging_area = None
+                session._coder_payloads_data = None
+            raise
 
     async def _notify_status(self, session_id: str, phase: str, detail: str) -> None:
         if not session_id:
             return
-        await get_session_manager().broadcast_to_session(session_id, {
+        session_mgr = get_session_manager()
+        session = session_mgr.get_session(session_id)
+        if session is not None:
+            session.phase = phase
+        await session_mgr.broadcast_to_session(session_id, {
             "type": "agent.status",
             "payload": {
                 "phase": phase,
@@ -190,6 +261,43 @@ class CoderAgent(BaseAgent):
                 "source": self._FRONTEND_SOURCE,
             },
         })
+
+    async def _apply_pending_guidance(
+        self,
+        session: Any,
+        request: Any,
+        session_id: str,
+        *,
+        detail: str,
+    ) -> bool:
+        """将 chatter 转发来的工作中引导注入到当前请求链。"""
+        if session is None or not session.coder_guidance_queue:
+            return False
+
+        guidance_texts: list[str] = []
+        while session.coder_guidance_queue:
+            guidance_texts.append(session.coder_guidance_queue.pop(0))
+
+        if not guidance_texts:
+            return False
+
+        request.add_payload(LLMPayload(ROLE.USER, Text("\n".join(guidance_texts))))
+        await self._notify_status(session_id, "coding", detail)
+        return True
+
+    async def _save_coder_progress(self, session: Any, request: Any) -> None:
+        """保存 Coder Agent 的当前进度到 session 中间字段。
+
+        将 Coder 的 payloads 序列化到 session._coder_payloads_data，
+        由 Main Agent 的 _auto_save 一并持久化到磁盘。
+        """
+        if session is None:
+            return
+        try:
+            from ..session_store import serialize_payload
+            session._coder_payloads_data = [serialize_payload(p) for p in request.payloads]
+        except Exception:
+            pass
 
     async def _push_context_usage(self, session_id: str, response: Any) -> None:
         """推送 Coder 的 LLM 上下文用量到前端。"""
@@ -215,7 +323,11 @@ class CoderAgent(BaseAgent):
                     cost = calculate_request_cost(model=model_entry, usage=usage)
                 except Exception:
                     pass
-        await get_session_manager().broadcast_to_session(session_id, {
+        session_mgr = get_session_manager()
+        session = session_mgr.get_session(session_id)
+        if session and session.session_store:
+            asyncio.ensure_future(session_mgr.persist_session_metadata(session_id))
+        await session_mgr.broadcast_to_session(session_id, {
             "type": "agent.context_usage",
             "payload": {
                 "total_tokens": total_tokens,
@@ -257,6 +369,7 @@ class CoderAgent(BaseAgent):
         session_id: str,
         name: str,
         args: dict[str, Any],
+        call_id: str = "",
         stage: str = "running",
     ) -> None:
         if not session_id:
@@ -264,7 +377,9 @@ class CoderAgent(BaseAgent):
         await get_session_manager().broadcast_to_session(session_id, {
             "type": "tool.call",
             "payload": {
+                "call_id": call_id,
                 "name": name,
+                "args": args,
                 "args_summary": self._summarize_args(args),
                 "source": self._FRONTEND_SOURCE,
                 "stage": stage,

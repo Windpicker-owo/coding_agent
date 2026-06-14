@@ -24,11 +24,52 @@ class ReadTool(CodingToolMixin, BaseTool):
         end_line: Annotated[int, "End line, 1-indexed. 0 means to end"] = 0,
     ) -> tuple[bool, str]:
         """读取文件内容，支持行号范围。"""
+        self._ensure_not_interrupted()
         try:
             target = self._resolve_path(path)
             self._check_path_safety(path)
         except ValueError as e:
             return False, str(e)
+
+        self._observe_staging_path(target)
+
+        # 检查暂存区：优先返回暂存内容
+        staging = self._get_staging_area()
+        if staging and staging.has_staged(str(target)):
+            staged_content = staging.get_staged_content(str(target))
+            if staged_content is not None:
+                content = staged_content
+                lines = content.splitlines(keepends=True)
+                total_lines = len(lines)
+
+                # 如果文件过大且未指定行号范围，截断显示
+                if total_lines > 500 and start_line == 0 and end_line == 0:
+                    head_lines = lines[:50]
+                    tail_lines = lines[-50:]
+                    head_text = self._format_lines(head_lines, start=1)
+                    tail_text = self._format_lines(tail_lines, start=total_lines - 49)
+                    omitted = total_lines - 100
+                    return True, (
+                        f"[暂存] 文件共 {total_lines} 行，显示前 50 行和后 50 行"
+                        f"（省略中间 {omitted} 行，请使用 start_line/end_line 查看）：\n\n"
+                        f"{head_text}\n"
+                        f"  ... (省略 {omitted} 行) ...\n\n"
+                        f"{tail_text}"
+                    )
+
+                # 应用行号范围
+                if start_line > 0 or end_line > 0:
+                    s = max(start_line - 1, 0) if start_line > 0 else 0
+                    e = end_line if end_line > 0 else total_lines
+                    lines = lines[s:e]
+                    display_start = s + 1
+                else:
+                    display_start = 1
+
+                formatted = self._format_lines(lines, start=display_start)
+                return True, f"[暂存] 文件 {path} ({total_lines} 行):\n{formatted}"
+
+        # 无暂存区或文件未暂存：走原有磁盘读取逻辑
 
         if not target.exists():
             return False, f"文件不存在: {target}"
