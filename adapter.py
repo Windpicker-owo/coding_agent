@@ -28,6 +28,7 @@ from src.app.plugin_system.base import BaseAdapter, BasePlugin
 from src.app.plugin_system.api import service_api
 from src.kernel.logger import get_logger
 
+from src.core.config import get_model_config
 from .session_manager import get_session_manager
 from .session_store import strip_display_prefixes
 
@@ -264,6 +265,7 @@ class CodingAgentAdapter(BaseAdapter):
             session_id = payload.get("session_id", "")
             solo_mode = payload.get("solo_mode", False)
             solo_model = payload.get("solo_model", "")
+            model_name = payload.get("model_name", "")
 
             # 清理旧会话（/new 或重新 init 时避免孤儿会话）
             old_session_id = self._conn_sessions.get(conn_id)
@@ -293,10 +295,12 @@ class CodingAgentAdapter(BaseAdapter):
                 )
                 resume_warning = ""
 
-            # 设置 solo 模式参数
+            # 设置 solo 模式参数与模型选择
             if solo_mode:
                 session.solo_mode = True
-                session.solo_model = solo_model
+                session.solo_model = model_name or solo_model
+            elif model_name:
+                session.main_model = model_name
 
             self._conn_sessions[conn_id] = session.id
             self._session_ws[session.id] = self._connections[conn_id]
@@ -304,6 +308,20 @@ class CodingAgentAdapter(BaseAdapter):
 
             # 构建 session.ready 事件
             await self._broadcast_session_ready(session.id, resume_warning=resume_warning)
+            return
+
+        # ── 无需会话上下文的消息 ──
+        if msg_type == "model.list":
+            ws = self._connections.get(conn_id)
+            if not ws:
+                return
+            model_config = get_model_config()
+            model_names = [m.name for m in model_config.models]
+            await ws.send(json.dumps({
+                "type": "model.list_result",
+                "payload": {"models": model_names},
+                "id": raw.get("id", ""),
+            }, ensure_ascii=False))
             return
 
         # ── 需要会话上下文的消息 ──
@@ -476,6 +494,28 @@ class CodingAgentAdapter(BaseAdapter):
 
         elif msg_type == "solo.toggle":
             session.solo_mode = raw.get("payload", {}).get("enabled", False)
+
+        elif msg_type == "model.select":
+            payload = raw.get("payload", {})
+            model_name = str(payload.get("model_name", "") or "")
+            model_config = get_model_config()
+            valid_names = {m.name for m in model_config.models}
+            if model_name and model_name not in valid_names:
+                await session_mgr.broadcast_to_session(session_id, {
+                    "type": "error",
+                    "payload": {"message": f"模型 '{model_name}' 不存在"},
+                })
+            else:
+                if session.solo_mode:
+                    session.solo_model = model_name
+                    mode_str = "solo"
+                else:
+                    session.main_model = model_name
+                    mode_str = "default"
+                await session_mgr.broadcast_to_session(session_id, {
+                    "type": "model.selected",
+                    "payload": {"model_name": model_name, "mode": mode_str},
+                })
 
         elif msg_type == "goal.set":
             session.goal_mode = True
@@ -1015,6 +1055,27 @@ class CodingAgentAdapter(BaseAdapter):
         *,
         resume_warning: str = "",
     ) -> dict[str, Any]:
+        # 确定当前活跃模型
+        if session.solo_mode:
+            active_model = session.solo_model or ""
+        else:
+            active_model = session.main_model or ""
+
+        # 若活跃模型为空，尝试取 coding_main task 的第一个模型
+        if not active_model:
+            try:
+                task_config = get_model_config().model_tasks.get_task("coding_main")
+                if task_config.model_list:
+                    active_model = task_config.model_list[0]
+            except (ValueError, KeyError):
+                pass
+
+        # 可用模型列表
+        try:
+            available_models = [m.name for m in get_model_config().models]
+        except Exception:
+            available_models = []
+
         ready_payload: dict[str, Any] = {
             "session_id": session.id,
             "project_name": (
@@ -1026,6 +1087,8 @@ class CodingAgentAdapter(BaseAdapter):
             "solo_mode": session.solo_mode,
             "auto_review_enabled": session.auto_review_enabled,
             "yolo_mode": session.yolo_mode,
+            "available_models": available_models,
+            "active_model": active_model,
             "checkpoints": (
                 session.checkpoint_manager.list_checkpoints()
                 if session.checkpoint_manager

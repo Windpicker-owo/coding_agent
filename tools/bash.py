@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import locale
 import sys
 import uuid
 from typing import Annotated
@@ -15,8 +16,23 @@ from ..services.terminal_environment import build_terminal_launch, get_preferred
 
 logger = get_logger("coding_agent.bash")
 
-# Windows 控制台默认编码
-_CONSOLE_ENCODING = "cp936" if sys.platform == "win32" else "utf-8"
+
+def _detect_console_encoding() -> str:
+    """动态检测控制台编码。
+
+    优先使用 sys.stdout.encoding，再 fallback 到 locale.getpreferredencoding()，
+    最后使用 utf-8。Win10 1809+ 默认终端已是 UTF-8。
+    """
+    for candidate in (
+        getattr(sys.stdout, "encoding", None),
+        locale.getpreferredencoding(),
+    ):
+        if candidate and candidate.lower() not in ("", "none"):
+            return candidate
+    return "utf-8"
+
+
+_CONSOLE_ENCODING = _detect_console_encoding()
 
 
 class BashTool(CodingToolMixin, BaseTool):

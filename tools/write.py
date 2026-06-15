@@ -7,8 +7,11 @@ import aiofiles
 from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool
+from src.kernel.logger import get_logger
 
 from .base import CodingToolMixin
+
+logger = get_logger("coding_agent.write")
 
 
 class WriteTool(CodingToolMixin, BaseTool):
@@ -42,10 +45,11 @@ class WriteTool(CodingToolMixin, BaseTool):
             current_content: str | None = staging.get_staged_content(str(target))
             if current_content is None and target.exists():
                 try:
-                    async with aiofiles.open(target, "r", encoding="utf-8", errors="replace") as f:
+                    async with aiofiles.open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
                         current_content = await f.read()
                 except OSError as e:
                     return False, f"读取文件失败: {e}"
+                self._warn_on_replace_char(current_content, str(target))
             self._ensure_not_interrupted()
             is_new_staged = not target.exists() and not staging.has_staged(str(target))
             try:
@@ -82,10 +86,11 @@ class WriteTool(CodingToolMixin, BaseTool):
         original_content: str | None = None
         if target.exists():
             try:
-                async with aiofiles.open(target, "r", encoding="utf-8", errors="replace") as f:
+                async with aiofiles.open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
                     original_content = await f.read()
             except OSError as e:
                 return False, f"读取文件失败: {e}"
+            self._warn_on_replace_char(original_content, str(target))
 
         # 创建 checkpoint 快照
         checkpoint_mgr = self._get_checkpoint_manager()
@@ -129,6 +134,17 @@ class WriteTool(CodingToolMixin, BaseTool):
 
         action_label = "创建" if is_new else "覆盖"
         return True, f"已{action_label}文件 {path}（{line_count} 行，{len(content)} 字节）"
+
+    @staticmethod
+    def _warn_on_replace_char(content: str, path: str) -> None:
+        """若内容包含替换字符 \\ufffd，发出警告。"""
+        if "\ufffd" in content:
+            positions = [i for i, ch in enumerate(content) if ch == "\ufffd"]
+            line_nums = {content[:pos].count("\n") + 1 for pos in positions[:10]}
+            logger.warning(
+                f"文件 {path} 包含非 UTF-8 字节序列，已替换为 \\ufffd，"
+                f"涉及行号: {sorted(line_nums)[:10]}"
+            )
 
     @staticmethod
     def _build_diff(path: str, original_content: str | None, new_content: str) -> str:

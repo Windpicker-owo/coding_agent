@@ -13,7 +13,8 @@ from src.app.plugin_system.base import (
 from src.app.plugin_system.types import ChatType
 
 from src.app.plugin_system.api.prompt_api import add_system_reminder, get_template
-from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, ToolResult, ToolRegistry
+from src.core.config import get_model_config
+from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, ToolResult, ToolRegistry, LLMContextManager, ReminderSourceSpec
 from src.kernel.logger import get_logger, COLOR
 
 from .config import CodingAgentConfig
@@ -194,11 +195,51 @@ class CodingAgentChatter(BaseChatter):
                     self._goal_round_modified = False  # 重置本轮修改标记
 
                     # 构建全新的干净上下文，不受前面对话影响
-                    current = self.create_request(
-                        task=self._get_model_task("main_task", "coding_main"),
-                        request_name="coding_goal_review",
-                        with_reminder="code_main_agent",
-                    )
+                    # 支持模型覆盖：solo 模式用 solo_model，否则用 main_model
+                    goal_model_name = ""
+                    if session.solo_mode:
+                        goal_model_name = session.solo_model or ""
+                    else:
+                        goal_model_name = session.main_model or ""
+
+                    if goal_model_name:
+                        try:
+                            model_set = get_model_config().get_model_set_by_name(goal_model_name)
+                        except KeyError:
+                            logger.warning(f"目标审查模型 '{goal_model_name}' 不存在，回退到 task 方式")
+                            current = self.create_request(
+                                task=self._get_model_task("main_task", "coding_main"),
+                                request_name="coding_goal_review",
+                                with_reminder="code_main_agent",
+                            )
+                            current.context_manager.context_compression_handler = (
+                                coding_context_compression_handler
+                            )
+                        else:
+                            context_manager = LLMContextManager(
+                                context_compression_handler=coding_context_compression_handler,
+                                reminder_sources=[
+                                    ReminderSourceSpec(
+                                        bucket="code_main_agent",
+                                        wrap_with_system_tag=True,
+                                    )
+                                ],
+                            )
+                            current = LLMRequest(
+                                model_set=model_set,
+                                request_name="coding_goal_review",
+                                meta_data={"stream_id": self.stream_id},
+                                context_manager=context_manager,
+                            )
+                    else:
+                        current = self.create_request(
+                            task=self._get_model_task("main_task", "coding_main"),
+                            request_name="coding_goal_review",
+                            with_reminder="code_main_agent",
+                        )
+                        current.context_manager.context_compression_handler = (
+                            coding_context_compression_handler
+                        )
                     current.add_payload(LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(
                         solo_mode=session.solo_mode,
                     ))))
@@ -697,16 +738,48 @@ class CodingAgentChatter(BaseChatter):
                 )
 
         # 构建请求，通过 with_reminder 注入 system reminder 槽位
-        request = self.create_request(
-            task=self._get_model_task("main_task", "coding_main"),
-            request_name="coding_agent",
-            with_reminder="code_main_agent",
-        )
+        # 支持 main_model 覆盖：若 session 指定了 main_model，直接按模型名构建
+        main_model_name = session.main_model if session else ""
+        used_direct_model = False
+        if main_model_name:
+            try:
+                model_set = get_model_config().get_model_set_by_name(main_model_name)
+            except KeyError:
+                logger.warning(f"main_model '{main_model_name}' 在 models 列表中不存在，回退到 task 方式")
+                request = self.create_request(
+                    task=self._get_model_task("main_task", "coding_main"),
+                    request_name="coding_agent",
+                    with_reminder="code_main_agent",
+                )
+            else:
+                context_manager = LLMContextManager(
+                    context_compression_handler=coding_context_compression_handler,
+                    reminder_sources=[
+                        ReminderSourceSpec(
+                            bucket="code_main_agent",
+                            wrap_with_system_tag=True,
+                        )
+                    ],
+                )
+                request = LLMRequest(
+                    model_set=model_set,
+                    request_name="coding_agent",
+                    meta_data={"stream_id": self.stream_id},
+                    context_manager=context_manager,
+                )
+                used_direct_model = True
+        else:
+            request = self.create_request(
+                task=self._get_model_task("main_task", "coding_main"),
+                request_name="coding_agent",
+                with_reminder="code_main_agent",
+            )
 
-        # 替换为编程场景专用的上下文压缩处理器
-        request.context_manager.context_compression_handler = (
-            coding_context_compression_handler
-        )
+        # 替换为编程场景专用的上下文压缩处理器（直接模型名方式已在构造时设置）
+        if not used_direct_model:
+            request.context_manager.context_compression_handler = (
+                coding_context_compression_handler
+            )
 
         # 填充人格信息
         system_prompt = await self._build_system_prompt()
@@ -735,20 +808,51 @@ class CodingAgentChatter(BaseChatter):
         session_mgr = get_session_manager()
         session = session_mgr.get_session_by_stream_id(self.stream_id)
 
-        # 确定使用的 task 名
-        task_name = session.solo_model if session and session.solo_model else self._get_model_task("main_task", "coding_main")
+        # 确定使用的模型名（优先按模型名直解，兼容旧 session 的 task 名）
+        model_name = session.solo_model if session and session.solo_model else ""
 
-        # 构建请求，使用 code_main_agent reminder 桶
-        request = self.create_request(
-            task=task_name,
-            request_name="coding_solo",
-            with_reminder="code_main_agent",
-        )
-
-        # 替换为编程场景专用的上下文压缩处理器
-        request.context_manager.context_compression_handler = (
-            coding_context_compression_handler
-        )
+        if model_name:
+            try:
+                model_set = get_model_config().get_model_set_by_name(model_name)
+            except KeyError:
+                # 模型名不存在，可能是旧 session 的 task 名，回退到 task 方式
+                logger.warning(f"模型 '{model_name}' 在 models 列表中不存在，尝试作为 task 名解析")
+                request = self.create_request(
+                    task=model_name,
+                    request_name="coding_solo",
+                    with_reminder="code_main_agent",
+                )
+                request.context_manager.context_compression_handler = (
+                    coding_context_compression_handler
+                )
+            else:
+                # 直接按模型名构建 LLMRequest
+                context_manager = LLMContextManager(
+                    context_compression_handler=coding_context_compression_handler,
+                    reminder_sources=[
+                        ReminderSourceSpec(
+                            bucket="code_main_agent",
+                            wrap_with_system_tag=True,
+                        )
+                    ],
+                )
+                request = LLMRequest(
+                    model_set=model_set,
+                    request_name="coding_solo",
+                    meta_data={"stream_id": self.stream_id},
+                    context_manager=context_manager,
+                )
+        else:
+            # Fallback：使用 task 配置
+            task_name = self._get_model_task("main_task", "coding_main")
+            request = self.create_request(
+                task=task_name,
+                request_name="coding_solo",
+                with_reminder="code_main_agent",
+            )
+            request.context_manager.context_compression_handler = (
+                coding_context_compression_handler
+            )
 
         # 填充人格信息（solo 模式）
         system_prompt = await self._build_system_prompt(solo_mode=True)

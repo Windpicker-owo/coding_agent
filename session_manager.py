@@ -63,7 +63,8 @@ class CodingSession:
     staging_area: Any = None  # FileStagingArea | None，Coder 执行期间的文件暂存区
     usage_total: dict[str, dict[str, Any]] = field(default_factory=dict)  # 按 model_name 累计用量
     solo_mode: bool = False  # Solo 模式：单一 agent 完成所有工作
-    solo_model: str = ""  # Solo 模式使用的 LLM task 名
+    solo_model: str = ""  # Solo 模式使用的模型名（model.toml 中 models 的 name）
+    main_model: str = ""  # 默认模式下覆盖主 Agent 使用的模型名（model.toml 中 models 的 name）
     payloads_data: list[dict[str, Any]] = field(default_factory=list)  # 当前会话的序列化 payload 快照
     timeline_events: list[dict[str, Any]] = field(default_factory=list)  # 可恢复的前端消息时间线
     conversation_markers: list[dict[str, Any]] = field(default_factory=list)  # 用户撤回 / fork 边界
@@ -172,6 +173,7 @@ class SessionManager:
             usage_total=dict(data.usage_total) if data.usage_total else {},
             solo_mode=data.solo_mode,
             solo_model=data.solo_model,
+            main_model=data.main_model,
             auto_review_enabled=data.auto_review_enabled,
             yolo_mode=data.yolo_mode,
             payloads_data=deepcopy(data.payloads),
@@ -218,6 +220,7 @@ class SessionManager:
             usage_total=session.usage_total,
             solo_mode=session.solo_mode,
             solo_model=session.solo_model,
+            main_model=session.main_model,
             auto_review_enabled=session.auto_review_enabled,
             yolo_mode=session.yolo_mode,
             checkpoints=checkpoint_data,
@@ -248,6 +251,7 @@ class SessionManager:
                 usage_total=deepcopy(session.usage_total),
                 solo_mode=session.solo_mode,
                 solo_model=session.solo_model,
+                main_model=session.main_model,
                 auto_review_enabled=session.auto_review_enabled,
                 yolo_mode=session.yolo_mode,
                 checkpoints=[],
@@ -265,6 +269,7 @@ class SessionManager:
             data.usage_total = deepcopy(session.usage_total)
             data.solo_mode = session.solo_mode
             data.solo_model = session.solo_model
+            data.main_model = session.main_model
             data.auto_review_enabled = session.auto_review_enabled
             data.yolo_mode = session.yolo_mode
             data.coder_payloads = session._coder_payloads_data
@@ -907,6 +912,7 @@ class SessionManager:
             usage_total=deepcopy(usage_total) if isinstance(usage_total, dict) else deepcopy(session.usage_total),
             solo_mode=session.solo_mode,
             solo_model=session.solo_model,
+            main_model=session.main_model,
             auto_review_enabled=session.auto_review_enabled,
             yolo_mode=session.yolo_mode,
             checkpoints=checkpoints,

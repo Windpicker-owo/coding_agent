@@ -55,7 +55,7 @@ class CodingAgentConfig(BaseConfig):
         host: str = Field(default="0.0.0.0", description="监听地址")
         port: int = Field(default=8765, description="监听端口")
         path: str = Field(default="/coding-agent/ws", description="WebSocket 路径")
-        tui_username: str = Field(default="TUI User", description="TUI 客户端显示的用户名")
+        tui_username: str = Field(default="User", description="客户端显示的用户名")
 
     @config_section("mcp", title="MCP 工具集成", tag="ai")
     class MCPSection(SectionBase):

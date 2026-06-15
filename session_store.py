@@ -284,7 +284,8 @@ class SessionData:
     linked_directories: list[str] = field(default_factory=list)  # 关联的外部项目目录
     usage_total: dict[str, dict[str, Any]] = field(default_factory=dict)  # 按 model_name 累计用量
     solo_mode: bool = False  # Solo 模式：单一 agent 完成所有工作
-    solo_model: str = ""  # Solo 模式使用的 LLM task 名
+    solo_model: str = ""  # Solo 模式使用的模型名
+    main_model: str = ""  # 默认模式下覆盖主 Agent 的模型名
     auto_review_enabled: bool = False  # 自动审查模式
     yolo_mode: bool = False  # 免审批模式
     checkpoints: list[dict[str, Any]] = field(default_factory=list)  # 持久化的 checkpoint 数据
@@ -342,6 +343,7 @@ class SessionStore:
                 "usage_total": data.usage_total,
                 "solo_mode": data.solo_mode,
                 "solo_model": data.solo_model,
+                "main_model": data.main_model,
                 "auto_review_enabled": data.auto_review_enabled,
                 "yolo_mode": data.yolo_mode,
                 "checkpoints": data.checkpoints,
@@ -396,6 +398,7 @@ class SessionStore:
             usage_total=raw.get("usage_total", {}),
             solo_mode=raw.get("solo_mode", False),
             solo_model=raw.get("solo_model", ""),
+            main_model=raw.get("main_model", ""),
             auto_review_enabled=raw.get("auto_review_enabled", False),
             yolo_mode=raw.get("yolo_mode", False),
             checkpoints=raw.get("checkpoints", []),

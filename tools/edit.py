@@ -7,8 +7,11 @@ import aiofiles
 from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool
+from src.kernel.logger import get_logger
 
 from .base import CodingToolMixin
+
+logger = get_logger("coding_agent.edit")
 
 
 class EditTool(CodingToolMixin, BaseTool):
@@ -17,7 +20,9 @@ class EditTool(CodingToolMixin, BaseTool):
     tool_name = "edit"
     tool_description = (
         "Make targeted edits to a file. Specify exact text to find and "
-        "replace. More efficient than rewriting entire files."
+        "replace. More efficient than rewriting entire files. "
+        "Line endings must match exactly; if the file uses CRLF, "
+        "either \\r\\n or \\n in old_text will be matched automatically."
     )
     chatter_allow = ["coding_agent"]
 
@@ -47,14 +52,23 @@ class EditTool(CodingToolMixin, BaseTool):
                 if not target.exists():
                     return False, f"文件不存在: {target}"
                 try:
-                    async with aiofiles.open(target, "r", encoding="utf-8", errors="replace") as f:
+                    async with aiofiles.open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
                         current = await f.read()
                 except OSError as e:
                     return False, f"读取文件失败: {e}"
+                self._warn_on_replace_char(current, str(target))
 
             # 查找出现次数
             count = current.count(old_text)
 
+            if count == 0:
+                # 换行符规范化重试
+                retry_old_text = self._normalize_newlines_for_match(current, old_text)
+                if retry_old_text != old_text:
+                    retry_count = current.count(retry_old_text)
+                    if retry_count == 1:
+                        old_text = retry_old_text
+                        count = 1
             if count == 0:
                 lines = current.splitlines()
                 old_lines = old_text.splitlines()
@@ -120,16 +134,26 @@ class EditTool(CodingToolMixin, BaseTool):
         if not target.exists():
             return False, f"文件不存在: {target}"
 
-        # 读取原文件内容
+        # 读取原文件内容（newline="" 保持原始换行符）
         try:
-            async with aiofiles.open(target, "r", encoding="utf-8", errors="replace") as f:
+            async with aiofiles.open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
                 original = await f.read()
         except OSError as e:
             return False, f"读取文件失败: {e}"
 
+        self._warn_on_replace_char(original, str(target))
+
         # 查找出现次数
         count = original.count(old_text)
 
+        if count == 0:
+            # 换行符规范化重试
+            retry_old_text = self._normalize_newlines_for_match(original, old_text)
+            if retry_old_text != old_text:
+                retry_count = original.count(retry_old_text)
+                if retry_count == 1:
+                    old_text = retry_old_text
+                    count = 1
         if count == 0:
             # 尝试提供近似匹配提示
             lines = original.splitlines()
@@ -192,3 +216,27 @@ class EditTool(CodingToolMixin, BaseTool):
             await self._notify_checkpoint_created(checkpoint)
 
         return True, f"已编辑 {path}:\n```diff\n{diff_text}\n```"
+
+    @staticmethod
+    def _normalize_newlines_for_match(content: str, old_text: str) -> str:
+        """尝试将 old_text 的换行符规范化以匹配文件的实际换行符。
+
+        文件用 CRLF 但 old_text 用 LF 时，将 old_text 中的 \\n 转为 \\r\\n；
+        文件用 LF 但 old_text 用 CRLF 时，将 old_text 中的 \\r\\n 转为 \\n。
+        """
+        if "\r\n" in content and "\r\n" not in old_text and "\n" in old_text:
+            return old_text.replace("\n", "\r\n")
+        if "\r\n" not in content and "\r\n" in old_text:
+            return old_text.replace("\r\n", "\n")
+        return old_text
+
+    @staticmethod
+    def _warn_on_replace_char(content: str, path: str) -> None:
+        """若内容包含替换字符 \\ufffd，发出警告。"""
+        if "\ufffd" in content:
+            positions = [i for i, ch in enumerate(content) if ch == "\ufffd"]
+            line_nums = {content[:pos].count("\n") + 1 for pos in positions[:10]}
+            logger.warning(
+                f"文件 {path} 包含非 UTF-8 字节序列，已替换为 \\ufffd，"
+                f"涉及行号: {sorted(line_nums)[:10]}"
+            )

@@ -6,15 +6,23 @@ import aiofiles
 from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool
+from src.kernel.logger import get_logger
 
 from .base import CodingToolMixin
+
+logger = get_logger("coding_agent.read")
 
 
 class ReadTool(CodingToolMixin, BaseTool):
     """读取文件内容。"""
 
     tool_name = "read"
-    tool_description = "Read file contents, optionally within a line range"
+    tool_description = (
+        "Read file contents, optionally within a line range. "
+        "Line endings are preserved as-is; the output header reports "
+        "the detected newline style (CRLF/LF/mixed). "
+        "Use start_line/end_line (1-indexed, 0=from start/to end) to view ranges."
+    )
     chatter_allow = ["coding_agent"]
 
     async def execute(
@@ -86,15 +94,18 @@ class ReadTool(CodingToolMixin, BaseTool):
         except OSError as e:
             return False, f"读取文件失败: {e}"
 
-        # 读取全部内容
+        # 读取全部内容（newline="" 保持原始换行符）
         try:
-            async with aiofiles.open(target, "r", encoding="utf-8", errors="replace") as f:
+            async with aiofiles.open(target, "r", encoding="utf-8", errors="replace", newline="") as f:
                 content = await f.read()
         except OSError as e:
             return False, f"读取文件失败: {e}"
 
+        self._warn_on_replace_char(content, str(target))
+
         lines = content.splitlines(keepends=True)
         total_lines = len(lines)
+        newline_type = self._detect_newline_type(lines)
 
         # 如果文件过大且未指定行号范围，截断显示
         if total_lines > 500 and start_line == 0 and end_line == 0:
@@ -104,7 +115,7 @@ class ReadTool(CodingToolMixin, BaseTool):
             tail_text = self._format_lines(tail_lines, start=total_lines - 49)
             omitted = total_lines - 100
             return True, (
-                f"文件共 {total_lines} 行，显示前 50 行和后 50 行"
+                f"文件共 {total_lines} 行，{newline_type}，显示前 50 行和后 50 行"
                 f"（省略中间 {omitted} 行，请使用 start_line/end_line 查看）：\n\n"
                 f"{head_text}\n"
                 f"  ... (省略 {omitted} 行) ...\n\n"
@@ -121,7 +132,7 @@ class ReadTool(CodingToolMixin, BaseTool):
             display_start = 1
 
         formatted = self._format_lines(lines, start=display_start)
-        return True, f"文件 {path} ({total_lines} 行):\n{formatted}"
+        return True, f"文件 {path} ({total_lines} 行, {newline_type}):\n{formatted}"
 
     @staticmethod
     def _format_lines(lines: list[str], start: int) -> str:
@@ -133,3 +144,31 @@ class ReadTool(CodingToolMixin, BaseTool):
             line_content = line.rstrip("\n").rstrip("\r")
             result.append(f"{line_num:>6} | {line_content}")
         return "\n".join(result)
+
+    @staticmethod
+    def _detect_newline_type(lines: list[str]) -> str:
+        """检测文件的换行符类型。"""
+        crlf = sum(1 for line in lines if line.endswith("\r\n"))
+        lf = sum(1 for line in lines if line.endswith("\n") and not line.endswith("\r\n"))
+        cr = sum(1 for line in lines if line.endswith("\r") and not line.endswith("\r\n"))
+        if crlf > 0 and lf == 0 and cr == 0:
+            return "CRLF"
+        elif lf > 0 and crlf == 0 and cr == 0:
+            return "LF"
+        elif cr > 0 and crlf == 0 and lf == 0:
+            return "CR"
+        elif crlf == 0 and lf == 0 and cr == 0:
+            return "no EOL"
+        else:
+            return "mixed"
+
+    @staticmethod
+    def _warn_on_replace_char(content: str, path: str) -> None:
+        """若内容包含替换字符 \ufffd，发出警告。"""
+        if "\ufffd" in content:
+            positions = [i for i, ch in enumerate(content) if ch == "\ufffd"]
+            line_nums = {content[:pos].count("\n") + 1 for pos in positions[:10]}
+            logger.warning(
+                f"文件 {path} 包含非 UTF-8 字节序列，已替换为 \\ufffd，"
+                f"涉及行号: {sorted(line_nums)[:10]}"
+            )

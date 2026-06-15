@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool
+from src.kernel.logger import get_logger
 
 from .base import CodingToolMixin
+
+logger = get_logger("coding_agent.grep")
 
 
 class GrepTool(CodingToolMixin, BaseTool):
@@ -73,13 +76,17 @@ class GrepTool(CodingToolMixin, BaseTool):
         except OSError as e:
             return False, f"执行 ripgrep 失败: {e}"
 
-        output = stdout.decode("utf-8", errors="replace").strip()
+        raw_output = stdout.decode("utf-8", errors="replace")
+        self._warn_on_replace_char(raw_output, "rg stdout")
+        output = raw_output.strip()
 
         if process.returncode == 1 and not output:
             return True, f"未找到匹配 '{pattern}' 的结果"
 
         if process.returncode not in (0, 1):
-            err = stderr.decode("utf-8", errors="replace").strip()
+            raw_err = stderr.decode("utf-8", errors="replace")
+            self._warn_on_replace_char(raw_err, "rg stderr")
+            err = raw_err.strip()
             return False, f"ripgrep 错误: {err}"
 
         lines = output.splitlines()
@@ -117,13 +124,17 @@ class GrepTool(CodingToolMixin, BaseTool):
         except OSError as e:
             return False, f"执行 grep 失败: {e}"
 
-        output = stdout.decode("utf-8", errors="replace").strip()
+        raw_output = stdout.decode("utf-8", errors="replace")
+        self._warn_on_replace_char(raw_output, "grep stdout")
+        output = raw_output.strip()
 
         if process.returncode == 1 and not output:
             return True, f"未找到匹配 '{pattern}' 的结果"
 
         if process.returncode not in (0, 1):
-            err = stderr.decode("utf-8", errors="replace").strip()
+            raw_err = stderr.decode("utf-8", errors="replace")
+            self._warn_on_replace_char(raw_err, "grep stderr")
+            err = raw_err.strip()
             return False, f"grep 错误: {err}"
 
         lines = output.splitlines()
@@ -132,3 +143,13 @@ class GrepTool(CodingToolMixin, BaseTool):
             output = "\n".join(lines) + f"\n\n... 结果已截断（超过 {max_results} 条）"
 
         return True, output if output else f"未找到匹配 '{pattern}' 的结果"
+
+    @staticmethod
+    def _warn_on_replace_char(content: str, source: str) -> None:
+        """若内容包含替换字符 \\ufffd，发出警告。"""
+        if "\ufffd" in content:
+            positions = [i for i, ch in enumerate(content) if ch == "\ufffd"]
+            logger.warning(
+                f"{source} 包含非 UTF-8 字节序列，已替换为 \\ufffd，"
+                f"出现 {len(positions)} 处"
+            )
