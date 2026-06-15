@@ -361,6 +361,13 @@ class SessionManager:
     def get_session(self, session_id: str) -> CodingSession | None:
         return self._sessions.get(session_id)
 
+    def get_session_ids_by_conn(self, conn_id: str) -> list[str]:
+        """返回指定连接关联的所有会话 ID（包括后台运行的）。"""
+        return [
+            sid for sid, sess in self._sessions.items()
+            if sess.conn_id == conn_id
+        ]
+
     def get_session_by_stream_id(self, stream_id: str) -> CodingSession | None:
         sid = self._stream_to_session.get(stream_id)
         return self._sessions.get(sid) if sid else None
@@ -522,11 +529,21 @@ class SessionManager:
         session._resume_payloads = deepcopy(payloads)
 
     async def broadcast_to_session(self, session_id: str, message: dict) -> None:
-        """向会话的 WebSocket 发送消息。"""
+        """向会话的 WebSocket 发送消息。
+
+        即使当前无 websocket（后台运行中的会话），也会记录 timeline，
+        确保切换回来时能恢复完整进度。
+        """
         session = self._sessions.get(session_id)
-        if not session or not session.websocket:
+        if not session:
             return
+        # 始终记录 timeline，即使没有 websocket（后台会话也需要追踪进度）
         payload_patch = self._record_frontend_event(session, message)
+        if not session.websocket:
+            # 后台会话：agent.status 的 phase 变化需持久化，使前端自动刷新可见
+            if str(message.get("type", "") or "") == "agent.status" and session.session_store:
+                asyncio.ensure_future(self.persist_session_metadata(session_id))
+            return  # 无 websocket 则不发送，但 timeline 已记录
         outbound = deepcopy(message)
         if payload_patch:
             payload = outbound.get("payload")

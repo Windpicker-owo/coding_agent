@@ -45,6 +45,7 @@ class CodingAgentChatter(BaseChatter):
     stream_tick_interval = 0.5
     associated_platforms = ["coding_agent"]
     chat_type = ChatType.PRIVATE
+    _FRONTEND_SOURCE = "agent"
 
     def __init__(self, stream_id: str, plugin: Any) -> None:
         super().__init__(stream_id, plugin)
@@ -290,6 +291,11 @@ class CodingAgentChatter(BaseChatter):
 
                 # 添加用户消息
                 current.add_payload(LLMPayload(ROLE.USER, Text(unreads_text)))
+
+                # 首条消息立即启动标题生成（fire-and-forget，不等待 LLM 响应）
+                if is_first:
+                    asyncio.create_task(self._generate_title(session_id, unreads_text))
+
                 await self._notify_status("thinking", "正在分析...")
 
             # 发送请求
@@ -326,7 +332,7 @@ class CodingAgentChatter(BaseChatter):
                 await self._notify_status("error", f"LLM 调用失败: {e}")
                 await session_mgr.broadcast_to_session(session_id, {
                     "type": "agent.text",
-                    "payload": {"content": current.message or "", "is_final": True},
+                    "payload": {"content": current.message or "", "is_final": True, "source": self._FRONTEND_SOURCE},
                 })
                 # 恢复 current 指针，重置 goal 审查状态
                 current = self._current_request
@@ -356,6 +362,7 @@ class CodingAgentChatter(BaseChatter):
                         "content": final_content,
                         "is_final": True,
                         "forkable": not self._is_goal_review_round,
+                        "source": self._FRONTEND_SOURCE,
                     },
                 })
             else:
@@ -366,6 +373,7 @@ class CodingAgentChatter(BaseChatter):
                         "content": current.message or "",
                         "is_final": True,
                         "forkable": False,
+                        "source": self._FRONTEND_SOURCE,
                     },
                 })
                 # 有工具调用 → 处理工具调用（可能多轮）
@@ -386,6 +394,7 @@ class CodingAgentChatter(BaseChatter):
                                 "content": current.message or "",
                                 "is_final": True,
                                 "forkable": not self._is_goal_review_round,
+                                "source": self._FRONTEND_SOURCE,
                             },
                         })
                 except Exception as e:
@@ -397,6 +406,7 @@ class CodingAgentChatter(BaseChatter):
                             "content": "\n当前回合已中止：工具调用后未能恢复到可见响应。你可以发送补充引导后重试。",
                             "is_final": True,
                             "forkable": False,
+                            "source": self._FRONTEND_SOURCE,
                         },
                     })
                     current = self._current_request
@@ -413,10 +423,6 @@ class CodingAgentChatter(BaseChatter):
                 self._record_final_agent_marker(session_id, payloads_data)
                 # 自动保存会话状态（fire-and-forget）
                 asyncio.create_task(self._auto_save(session_id))
-
-            # 首条消息后生成标题（fire-and-forget）
-            if is_first:
-                asyncio.create_task(self._generate_title(session_id, unreads_text))
 
             # ── Goal 模式完成检查 ──
             session = session_mgr.get_session(session_id)
@@ -622,6 +628,15 @@ class CodingAgentChatter(BaseChatter):
             if title:
                 session_mgr = get_session_manager()
                 await session_mgr.update_session_title(session_id, title)
+                # 推送标题变更到前端，使 UI 即时刷新
+                await session_mgr.broadcast_to_session(session_id, {
+                    "type": "session.rename_result",
+                    "payload": {
+                        "session_id": session_id,
+                        "title": title,
+                        "success": True,
+                    },
+                })
                 logger.info(f"会话 {session_id[:8]} 标题已生成: {title!r}")
         except Exception:
             logger.error("生成会话标题失败")
@@ -992,6 +1007,7 @@ class CodingAgentChatter(BaseChatter):
                         ),
                         "args": call.args if hasattr(call, "args") else {},
                         "reason": self._get_tool_reason(registry, call.name),
+                        "source": self._FRONTEND_SOURCE,
                         "stage": "running",
                     },
                 })
@@ -1222,7 +1238,7 @@ class CodingAgentChatter(BaseChatter):
             session.phase = phase
             await get_session_manager().broadcast_to_session(session.id, {
                 "type": "agent.status",
-                "payload": {"phase": phase, "detail": detail, "source": "agent"},
+                "payload": {"phase": phase, "detail": detail, "source": self._FRONTEND_SOURCE},
             })
 
     @staticmethod
@@ -1259,7 +1275,7 @@ class CodingAgentChatter(BaseChatter):
         """推送 agent.text 流式 chunk 到前端。"""
         await get_session_manager().broadcast_to_session(session_id, {
             "type": "agent.text",
-            "payload": {"content": chunk, "is_final": False},
+            "payload": {"content": chunk, "is_final": False, "source": self._FRONTEND_SOURCE},
         })
 
     async def _stream_thinking_to_frontend(
@@ -1270,7 +1286,7 @@ class CodingAgentChatter(BaseChatter):
         """推送 agent.thinking 快照到前端。"""
         await get_session_manager().broadcast_to_session(session_id, {
             "type": "agent.thinking",
-            "payload": {"content": content},
+            "payload": {"content": content, "source": self._FRONTEND_SOURCE},
         })
 
     @staticmethod

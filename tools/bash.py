@@ -221,17 +221,18 @@ class BashTool(CodingToolMixin, BaseTool):
 
         # 通知前端 bash 输出
         session = self._get_current_session()
+        return_code = process.returncode
         if session:
             mgr = self._get_session_manager()
             if stdout_text:
                 await mgr.broadcast_to_session(session.id, {
                     "type": "bash.output",
-                    "payload": {"stream": "stdout", "content": stdout_text, "is_final": True},
+                    "payload": {"stream": "stdout", "content": stdout_text, "is_final": True, "exit_code": return_code},
                 })
             if stderr_text:
                 await mgr.broadcast_to_session(session.id, {
                     "type": "bash.output",
-                    "payload": {"stream": "stderr", "content": stderr_text, "is_final": True},
+                    "payload": {"stream": "stderr", "content": stderr_text, "is_final": True, "exit_code": return_code},
                 })
 
         output_parts = []
@@ -241,7 +242,6 @@ class BashTool(CodingToolMixin, BaseTool):
             output_parts.append(f"[stderr]\n{stderr_text}")
 
         output = "\n".join(output_parts) if output_parts else "(无输出)"
-        return_code = process.returncode
 
         if return_code == 0:
             return True, output

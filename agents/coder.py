@@ -341,8 +341,30 @@ class CoderAgent(BaseAgent):
                     pass
         session_mgr = get_session_manager()
         session = session_mgr.get_session(session_id)
-        if session and session.session_store:
+        if session is None:
+            return
+        
+        # 累加到 session.usage_total（与主 agent 一致）
+        if model_name not in session.usage_total:
+            session.usage_total[model_name] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cache_hit_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "cost": 0.0,
+                "request_count": 0,
+            }
+        model_usage = session.usage_total[model_name]
+        model_usage["prompt_tokens"] = model_usage.get("prompt_tokens", 0) + int(usage.get("prompt_tokens", 0) or 0)
+        model_usage["completion_tokens"] = model_usage.get("completion_tokens", 0) + int(usage.get("completion_tokens", 0) or 0)
+        model_usage["cache_hit_tokens"] = model_usage.get("cache_hit_tokens", 0) + int(usage.get("cache_hit_tokens", 0) or 0)
+        model_usage["cost"] = model_usage.get("cost", 0.0) + cost
+        model_usage["request_count"] = model_usage.get("request_count", 0) + 1
+
+        if session.session_store:
             asyncio.ensure_future(session_mgr.persist_session_metadata(session_id))
+        # 发送 Coder 单次用量（非累计），前端会与主 agent 累计值合并
         await session_mgr.broadcast_to_session(session_id, {
             "type": "agent.context_usage",
             "payload": {

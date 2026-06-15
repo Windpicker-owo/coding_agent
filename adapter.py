@@ -165,13 +165,14 @@ class CodingAgentAdapter(BaseAdapter):
             self._connections.pop(conn_id, None)
             session_id = self._conn_sessions.pop(conn_id, None)
             if session_id:
-                # 在 destroy 前断开 websocket 引用，防止 broadcast_to_session 尝试向已关闭的连接发送
                 self._session_ws.pop(session_id, None)
-                session_mgr = get_session_manager()
-                session = session_mgr.get_session(session_id)
-                if session:
-                    session.websocket = None
-                await session_mgr.destroy_session(session_id)
+            session_mgr = get_session_manager()
+            # 清理该连接关联的所有会话（当前 + 后台孤儿）
+            for sid in session_mgr.get_session_ids_by_conn(conn_id):
+                sess = session_mgr.get_session(sid)
+                if sess:
+                    sess.websocket = None
+                await session_mgr.destroy_session(sid)
             logger.info(f"TUI 连接 {conn_id[:8]} 已关闭")
 
     async def _handle_raw_with_conn(self, raw: dict, conn_id: str) -> None:
@@ -184,12 +185,12 @@ class CodingAgentAdapter(BaseAdapter):
             payload = raw.get("payload", {})
             working_directory = payload.get("working_directory", ".")
             
-            # 清理旧会话
-            old_session_id = self._conn_sessions.get(conn_id)
+            # 清理该连接关联的所有旧会话（切换项目，全部重置）
+            for sid in session_mgr.get_session_ids_by_conn(conn_id):
+                await session_mgr.destroy_session(sid)
+            old_session_id = self._conn_sessions.pop(conn_id, None)
             if old_session_id:
-                await session_mgr.destroy_session(old_session_id)
                 self._session_ws.pop(old_session_id, None)
-                self._conn_sessions.pop(conn_id, None)
 
             summaries = await session_mgr.list_sessions(working_directory)
             project_name = working_directory.rstrip("/\\").split("/")[-1] or working_directory.rstrip("/\\").split("\\")[-1]
@@ -267,10 +268,12 @@ class CodingAgentAdapter(BaseAdapter):
             solo_model = payload.get("solo_model", "")
             model_name = payload.get("model_name", "")
 
-            # 清理旧会话（/new 或重新 init 时避免孤儿会话）
+            # 切换会话：不销毁旧会话，让它后台继续运行
             old_session_id = self._conn_sessions.get(conn_id)
             if old_session_id and old_session_id != session_id:
-                await session_mgr.destroy_session(old_session_id)
+                old_session = session_mgr.get_session(old_session_id)
+                if old_session:
+                    old_session.websocket = None  # 解绑 websocket，broadcast 只记 timeline 不发
                 self._session_ws.pop(old_session_id, None)
 
             if session_id:
@@ -280,6 +283,7 @@ class CodingAgentAdapter(BaseAdapter):
                     working_directory=working_directory,
                     session_id=session_id,
                 )
+                is_new = False
                 if session is None:
                     # 恢复失败，回退到新建
                     session = await session_mgr.create_session(
@@ -287,6 +291,7 @@ class CodingAgentAdapter(BaseAdapter):
                         working_directory=working_directory,
                     )
                     resume_warning = ""
+                    is_new = True
             else:
                 # 新建模式
                 session = await session_mgr.create_session(
@@ -294,6 +299,7 @@ class CodingAgentAdapter(BaseAdapter):
                     working_directory=working_directory,
                 )
                 resume_warning = ""
+                is_new = True
 
             # 设置 solo 模式参数与模型选择
             if solo_mode:
@@ -305,6 +311,11 @@ class CodingAgentAdapter(BaseAdapter):
             self._conn_sessions[conn_id] = session.id
             self._session_ws[session.id] = self._connections[conn_id]
             session.websocket = self._connections[conn_id]
+
+            # 新会话立即持久化到磁盘，使 session.list 能立即返回
+            # 恢复模式不 persist——磁盘已有数据，避免更新 last_active_at
+            if is_new and session.session_store:
+                await session_mgr.persist_session_metadata(session.id)
 
             # 构建 session.ready 事件
             await self._broadcast_session_ready(session.id, resume_warning=resume_warning)
@@ -1084,6 +1095,7 @@ class CodingAgentAdapter(BaseAdapter):
             ),
             "working_directory": session.working_directory,
             "title": session._title or "",
+            "phase": session.phase,
             "solo_mode": session.solo_mode,
             "auto_review_enabled": session.auto_review_enabled,
             "yolo_mode": session.yolo_mode,
@@ -1094,6 +1106,7 @@ class CodingAgentAdapter(BaseAdapter):
                 if session.checkpoint_manager
                 else []
             ),
+            "usage_total": session.usage_total,
         }
 
         if session.timeline_events:
