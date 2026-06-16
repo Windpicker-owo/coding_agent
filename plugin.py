@@ -11,8 +11,9 @@ from .chatter import CodingAgentChatter
 from .adapter import CodingAgentAdapter
 from .services.project_context import ProjectContextService
 from .tools import (
-    BashTool, ReadTool, WriteTool, EditTool,
+    ConsoleTool, ReadTool, WriteTool, EditTool,
     GrepTool, FindTool, LsTool,
+    EnterPhaseTool,
 )
 from .agents import (
     ProjectScoutAgent, ModuleResearcherAgent,
@@ -46,8 +47,9 @@ class CodingAgentPlugin(BasePlugin):
             # Service
             ProjectContextService,
             # Tools
-            BashTool, ReadTool, WriteTool, EditTool,
+            ConsoleTool, ReadTool, WriteTool, EditTool,
             GrepTool, FindTool, LsTool,
+            EnterPhaseTool,
             # Agents
             ProjectScoutAgent, ModuleResearcherAgent,
             CoderAgent, AutoReviewAgent,

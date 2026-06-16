@@ -170,8 +170,8 @@ def build_timeline_from_payloads(payloads: list[dict[str, Any]]) -> list[dict[st
                     "kind": "tool_result",
                     "tool_name": tool_name or raw_name or "unknown",
                 }
-                if tool_name == "bash":
-                    metadata["kind"] = "bash_output"
+                if tool_name in ("bash", "console"):
+                    metadata["kind"] = "console_output"
                     metadata["stream"] = "stdout"
                 timeline.append({
                     "id": event_id,

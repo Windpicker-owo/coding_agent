@@ -42,12 +42,12 @@ class CodingAgentConfig(BaseConfig):
         cache_ttl_hours: int = Field(default=24, description="项目理解缓存有效期（小时）")
         max_parallel_researchers: int = Field(default=6, description="最大并行研究员数")
 
-    @config_section("bash", title="Bash 工具", tag="advanced")
-    class BashSection(SectionBase):
-        """Bash 工具配置。"""
+    @config_section("console", title="Console 工具", tag="advanced")
+    class ConsoleSection(SectionBase):
+        """Console 工具配置。"""
         default_timeout: int = Field(default=30, description="默认超时秒数")
         max_output_lines: int = Field(default=200, description="最大输出行数")
-        preferred_terminal: str = Field(default="", description="优先使用的终端环境，如 pwsh、powershell、cmd、bash")
+        preferred_terminal: str = Field(default="", description="优先使用的终端环境，如 pwsh、powershell、cmd、console")
 
     @config_section("ws", title="WebSocket 适配器", tag="network")
     class WsSection(SectionBase):
@@ -66,7 +66,7 @@ class CodingAgentConfig(BaseConfig):
 
     model: ModelSection = Field(default_factory=ModelSection)
     context: ContextSection = Field(default_factory=ContextSection)
-    bash: BashSection = Field(default_factory=BashSection)
+    console: ConsoleSection = Field(default_factory=ConsoleSection)
     ws: WsSection = Field(default_factory=WsSection)
     mcp: MCPSection = Field(default_factory=MCPSection)
     model_profiles: list[CoderModelProfile] = Field(

@@ -576,7 +576,7 @@ class SessionManager:
         session.pending_approvals[request_id] = event
 
         await self.broadcast_to_session(session_id, {
-            "type": "bash.approval_request",
+            "type": "console.approval_request",
             "payload": {
                 "request_id": request_id,
                 "command": command,
@@ -1050,7 +1050,7 @@ class SessionManager:
             )
             return None
 
-        if msg_type == "bash.output":
+        if msg_type == "console.output":
             self._flush_thinking_buffers(session)
             content = str(payload.get("content", payload.get("output", "")) or "")
             if not content:
@@ -1060,7 +1060,7 @@ class SessionManager:
                 role="system",
                 content=content,
                 metadata={
-                    "kind": "bash_output",
+                    "kind": "console_output",
                     "exit_code": payload.get("exit_code"),
                     "stream": payload.get("stream", "stdout"),
                 },

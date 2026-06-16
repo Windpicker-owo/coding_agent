@@ -29,8 +29,9 @@ from .services.project_context import ProjectContextService
 from .services.terminal_environment import get_preferred_terminal_from_config
 from .services.tool_loop_guard import advance_silent_tool_rounds
 from .tools import (
-    BashTool, ReadTool, WriteTool, EditTool,
+    ConsoleTool, ReadTool, WriteTool, EditTool,
     CreatePlanTool, ImplementPlanTool,
+    EnterPhaseTool,
 )
 
 logger = get_logger("coding_agent.chatter", display="CodingAgent", color=COLOR.YELLOW)
@@ -252,12 +253,12 @@ class CodingAgentChatter(BaseChatter):
                     registry = ToolRegistry()
                     if session.solo_mode:
                         for tool_cls in [
-                            BashTool, ReadTool, WriteTool, EditTool,
+                            ConsoleTool, ReadTool, WriteTool, EditTool,
                         ]:
                             registry.register(tool_cls)
                     else:
                         for tool_cls in [
-                            BashTool, ReadTool, WriteTool, EditTool,
+                            ConsoleTool, ReadTool, WriteTool, EditTool,
                             CreatePlanTool, ImplementPlanTool,
                         ]:
                             registry.register(tool_cls)
@@ -803,8 +804,9 @@ class CodingAgentChatter(BaseChatter):
         # 注入工具
         registry = ToolRegistry()
         for tool_cls in [
-            BashTool, ReadTool, WriteTool, EditTool,
+            ConsoleTool, ReadTool, WriteTool, EditTool,
             CreatePlanTool, ImplementPlanTool,
+            EnterPhaseTool,
         ]:
             registry.register(tool_cls)
 
@@ -873,10 +875,10 @@ class CodingAgentChatter(BaseChatter):
         system_prompt = await self._build_system_prompt(solo_mode=True)
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
-        # 注入工具（与 Coder Agent 一致：Bash/Read/Write/Edit + MCP）
+        # 注入工具（与 Coder Agent 一致：Console/Read/Write/Edit + MCP）
         registry = ToolRegistry()
         for tool_cls in [
-            BashTool, ReadTool, WriteTool, EditTool,
+            ConsoleTool, ReadTool, WriteTool, EditTool,
         ]:
             registry.register(tool_cls)
 
@@ -1260,7 +1262,7 @@ class CodingAgentChatter(BaseChatter):
             "- 对照目标逐条确认，目标已 100% 达成\n"
             "- 没有任何可以进一步优化的空间\n\n"
             "如果目标尚未完全达成或有优化空间：\n"
-            "1. 使用 write/edit/bash 等工具修改代码\n"
+            "1. 使用 write/edit/console 等工具修改代码\n"
             "2. 修改完成后，将本轮变更摘要写入 GOAL 上下文文档（" + goal_doc_path + "）\n"
             "3. **如果你在本轮修改了任何文件，绝对不能输出 GOAL COMPLETE**\n"
             "   必须先进入下一轮审查\n\n"

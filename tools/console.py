@@ -35,10 +35,10 @@ def _detect_console_encoding() -> str:
 _CONSOLE_ENCODING = _detect_console_encoding()
 
 
-class BashTool(CodingToolMixin, BaseTool):
+class ConsoleTool(CodingToolMixin, BaseTool):
     """在当前系统终端环境中执行命令。需要用户审批。"""
 
-    tool_name = "bash"
+    tool_name = "console"
     tool_description = (
         "Execute a command in the current system terminal environment. "
         "Commands require user approval unless pre-approved."
@@ -133,13 +133,13 @@ class BashTool(CodingToolMixin, BaseTool):
         checkpoint = None
         if checkpoint_mgr:
             agent_name = getattr(self, "agent_name", "coding_agent")
-            checkpoint = await checkpoint_mgr.snapshot_before_bash(command, agent_name)
+            checkpoint = await checkpoint_mgr.snapshot_before_console(command, agent_name)
 
         success, output = await self._execute_command(command, timeout)
 
-        # 记录 bash 文件变更
+        # 记录 console 文件变更
         if checkpoint_mgr and checkpoint:
-            await checkpoint_mgr.record_bash_file_changes(checkpoint.id)
+            await checkpoint_mgr.record_console_file_changes(checkpoint.id)
             await self._notify_checkpoint_created(checkpoint)
 
         return success, output
@@ -226,12 +226,12 @@ class BashTool(CodingToolMixin, BaseTool):
             mgr = self._get_session_manager()
             if stdout_text:
                 await mgr.broadcast_to_session(session.id, {
-                    "type": "bash.output",
+                    "type": "console.output",
                     "payload": {"stream": "stdout", "content": stdout_text, "is_final": True, "exit_code": return_code},
                 })
             if stderr_text:
                 await mgr.broadcast_to_session(session.id, {
-                    "type": "bash.output",
+                    "type": "console.output",
                     "payload": {"stream": "stderr", "content": stderr_text, "is_final": True, "exit_code": return_code},
                 })
 

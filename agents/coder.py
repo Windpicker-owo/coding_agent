@@ -23,7 +23,7 @@ from ..config import CoderModelProfile
 
 from ..context_compression import coding_context_compression_handler
 from ..mcp_integration import get_mcp_tools_for_agent
-from ..tools import BashTool, ReadTool, WriteTool, EditTool
+from ..tools import ConsoleTool, ReadTool, WriteTool, EditTool
 from ..prompts import build_environment_info
 from ..session_manager import get_session_manager
 from ..services.terminal_environment import get_preferred_terminal_from_config
@@ -36,7 +36,7 @@ class CoderAgent(BaseAgent):
     agent_description = "按照落地计划精确实施代码变更"
     chatter_allow = ["coding_agent"]
     associated_types = ["text"]
-    usables = [BashTool, ReadTool, WriteTool, EditTool]  # 可写工具
+    usables = [ConsoleTool, ReadTool, WriteTool, EditTool]  # 可写工具
     _FRONTEND_SOURCE = "coder"
     _AUTO_SAVE_MIN_INTERVAL: float = 3.0  # 防抖自动保存最小间隔秒数
     _FINAL_GUIDANCE_GRACE_SECONDS: float = 0.35  # 收尾前短暂等待追加引导转发

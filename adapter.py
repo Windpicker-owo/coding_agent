@@ -475,7 +475,7 @@ class CodingAgentAdapter(BaseAdapter):
                     },
                 })
 
-        elif msg_type == "bash.approval":
+        elif msg_type == "console.approval":
             payload = raw.get("payload", {})
             await session_mgr.submit_approval(
                 session_id,
@@ -671,6 +671,8 @@ class CodingAgentAdapter(BaseAdapter):
                 "warnings": result.warnings,
             },
         })
+        if session.session_store:
+            await session_mgr.persist_session_metadata(session.id)
 
     async def _handle_checkpoint_list(self, session: Any) -> None:
         if not session.checkpoint_manager:
@@ -705,8 +707,21 @@ class CodingAgentAdapter(BaseAdapter):
             session_mgr.cache_payloads_data(session.id, payload_snapshot)
 
         checkpoint_id = str(marker.get("checkpoint_id", "") or "")
+        rollback_result = None
         if checkpoint_id and session.checkpoint_manager:
-            await session.checkpoint_manager.rollback_to(checkpoint_id)
+            rollback_result = await session.checkpoint_manager.rollback_to(checkpoint_id)
+            if rollback_result.warnings:
+                await session_mgr.broadcast_to_session(session.id, {
+                    "type": "checkpoint.rollback_result",
+                    "payload": {
+                        "rolled_back": rollback_result.rolled_back_checkpoints,
+                        "restored_files": rollback_result.restored_files,
+                        "warnings": rollback_result.warnings,
+                    },
+                })
+                if session.session_store:
+                    await session_mgr.persist_session_metadata(session.id)
+                return
 
         restored = session_mgr.restore_conversation_to_marker(
             session.id,

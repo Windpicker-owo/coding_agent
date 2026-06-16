@@ -52,7 +52,7 @@ class Checkpoint:
     timestamp: float
     agent_name: str
     is_reversible: bool
-    bash_command: str | None = None
+    console_command: str | None = None
 
     def to_dict(self) -> dict:
         """序列化为可 JSON 化的字典。"""
@@ -65,7 +65,7 @@ class Checkpoint:
             "timestamp": self.timestamp,
             "agent_name": self.agent_name,
             "is_reversible": self.is_reversible,
-            "bash_command": self.bash_command,
+            "console_command": self.console_command,
         }
 
     @staticmethod
@@ -80,7 +80,7 @@ class Checkpoint:
             timestamp=data["timestamp"],
             agent_name=data["agent_name"],
             is_reversible=data["is_reversible"],
-            bash_command=data.get("bash_command"),
+            console_command=data.get("console_command", data.get("bash_command")),
         )
 
 
@@ -92,14 +92,37 @@ class RollbackResult:
     warnings: list[str]
 
 
-# 只读命令前缀
+@dataclass
+class _ConsoleFileState:
+    """console checkpoint 的命令前文件状态。"""
+
+    path: str
+    exists: bool
+    content: bytes | None
+    mode: int | None
+
+
+# 只读命令前缀。
+# 这里必须保守：宁可把可回滚的命令误判为“可能写入”，也不能把真实会写文件的命令
+# 误判为只读，否则会跳过命令前快照，导致恢复时丢失用户已有的工作区状态。
 _READONLY_PREFIXES = [
     "cat", "head", "tail", "less", "more", "grep", "rg", "find",
     "ls", "tree", "wc", "file", "stat", "diff", "cmp",
     "git log", "git diff", "git status", "git branch", "git show",
     "git blame", "git tag", "git remote", "git shortlog",
-    "echo", "printf", "date", "whoami", "hostname", "uname",
-    "python -c", "python3 -c", "node -e",
+    "date", "whoami", "hostname", "uname", "pwd",
+]
+
+_READONLY_BLOCKERS = [
+    ">",
+    "out-file",
+    "set-content",
+    "add-content",
+    "tee-object",
+    "tee ",
+    "python -c",
+    "python3 -c",
+    "node -e",
 ]
 
 
@@ -115,6 +138,7 @@ class CheckpointManager:
         self._checkpoints: list[Checkpoint] = []
         self._step_counter: int = 0
         self._git_available: bool = (Path(working_directory) / ".git").is_dir()
+        self._console_baselines: dict[str, dict[str, _ConsoleFileState]] = {}
 
     async def snapshot_before_write(
         self, target_path: str, agent_name: str, description: str,
@@ -163,10 +187,10 @@ class CheckpointManager:
         self._checkpoints.append(checkpoint)
         return checkpoint
 
-    async def snapshot_before_bash(
+    async def snapshot_before_console(
         self, command: str, agent_name: str
     ) -> Checkpoint:
-        """bash 操作前创建快照。"""
+        """console 操作前创建快照。"""
         self._step_counter += 1
 
         is_readonly = self._is_readonly_command(command)
@@ -184,15 +208,17 @@ class CheckpointManager:
         checkpoint = Checkpoint(
             id=str(uuid4()),
             step_index=self._step_counter,
-            tool_name="bash",
-            description=f"bash: {command[:80]}",
+            tool_name="console",
+            description=f"console: {command[:80]}",
             file_snapshots=snapshots,
             timestamp=time.time(),
             agent_name=agent_name,
             is_reversible=is_reversible,
-            bash_command=command,
+            console_command=command,
         )
         self._checkpoints.append(checkpoint)
+        if self._git_available and not is_readonly:
+            self._console_baselines[checkpoint.id] = await self._capture_console_baseline()
         return checkpoint
 
     async def snapshot_before_user_message(
@@ -223,8 +249,8 @@ class CheckpointManager:
         self._checkpoints.append(checkpoint)
         return checkpoint
 
-    async def record_bash_file_changes(self, checkpoint_id: str) -> None:
-        """bash 执行后检测文件变更并补充快照。"""
+    async def record_console_file_changes(self, checkpoint_id: str) -> None:
+        """console 执行后检测文件变更并补充快照。"""
         checkpoint = None
         for cp in self._checkpoints:
             if cp.id == checkpoint_id:
@@ -236,31 +262,8 @@ class CheckpointManager:
 
         if self._git_available:
             try:
-                import asyncio
-                process = await asyncio.create_subprocess_exec(
-                    "git", "diff", "--name-only",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=self._working_dir,
-                )
-                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
-                changed_files = stdout.decode("utf-8", errors="replace").strip().splitlines()
-
-                for file_path in changed_files:
-                    full_path = Path(self._working_dir) / file_path
-                    if full_path.exists():
-                        try:
-                            content = full_path.read_bytes()
-                            mode = full_path.stat().st_mode
-                        except OSError:
-                            content = None
-                            mode = None
-                        checkpoint.file_snapshots.append(FileSnapshot(
-                            path=str(full_path),
-                            action="modify",
-                            original_content=content,
-                            original_mode=mode,
-                        ))
+                baseline = self._console_baselines.pop(checkpoint_id, {})
+                checkpoint.file_snapshots = await self._build_console_snapshots(baseline)
             except Exception:
                 pass
 
@@ -274,7 +277,12 @@ class CheckpointManager:
             )
         last = self._checkpoints[-1]
         result = await self._rollback_checkpoint(last)
-        self._checkpoints.pop()
+        if result.warnings:
+            result.warnings.append(
+                f"检查点 {last.id} 未完全恢复，已保留以便重试"
+            )
+        else:
+            self._checkpoints.pop()
         return result
 
     async def rollback_to(self, checkpoint_id: str) -> RollbackResult:
@@ -295,6 +303,7 @@ class CheckpointManager:
         all_rolled_back: list[str] = []
         all_restored: list[str] = []
         all_warnings: list[str] = []
+        truncate_to = len(self._checkpoints)
 
         # 从最新到 target 逐个回滚
         for i in range(len(self._checkpoints) - 1, target_idx - 1, -1):
@@ -303,9 +312,16 @@ class CheckpointManager:
             all_rolled_back.extend(result.rolled_back_checkpoints)
             all_restored.extend(result.restored_files)
             all_warnings.extend(result.warnings)
+            if result.warnings:
+                all_warnings.append(
+                    f"回滚在检查点 {cp.id} 处中止，未完全恢复的检查点已保留"
+                )
+                truncate_to = i + 1
+                break
+            truncate_to = i
 
         # 截断列表
-        self._checkpoints = self._checkpoints[:target_idx]
+        self._checkpoints = self._checkpoints[:truncate_to]
 
         return RollbackResult(
             rolled_back_checkpoints=all_rolled_back,
@@ -314,48 +330,11 @@ class CheckpointManager:
         )
 
     async def _rollback_checkpoint(self, cp: Checkpoint) -> RollbackResult:
-        """回滚单个 checkpoint：逐文件还原。
-
-        对于 bash checkpoint 且 git 可用时，优先使用 git checkout 恢复，
-        避免因 snapshot 保存时机导致的内容不一致。
-        """
+        """回滚单个 checkpoint：逐文件还原。"""
         restored: list[str] = []
         warnings: list[str] = []
 
-        # bash checkpoint + git 可用：直接用 git checkout 恢复文件
-        if cp.tool_name == "bash" and self._git_available and cp.file_snapshots:
-            import asyncio as _asyncio
-            for snapshot in cp.file_snapshots:
-                file_path = snapshot.path
-                try:
-                    proc = await _asyncio.create_subprocess_exec(
-                        "git", "checkout", "--", file_path,
-                        stdout=_asyncio.subprocess.DEVNULL,
-                        stderr=_asyncio.subprocess.PIPE,
-                        cwd=self._working_dir,
-                    )
-                    _, stderr = await _asyncio.wait_for(
-                        proc.communicate(), timeout=10,
-                    )
-                    if proc.returncode == 0:
-                        restored.append(file_path)
-                    else:
-                        err_msg = (
-                            stderr.decode("utf-8", errors="replace").strip()
-                            if stderr else "unknown error"
-                        )
-                        warnings.append(
-                            f"git checkout {file_path} 失败: {err_msg}"
-                        )
-                except Exception as e:
-                    warnings.append(f"git checkout {file_path} 异常: {e}")
-            return RollbackResult(
-                rolled_back_checkpoints=[cp.id],
-                restored_files=restored,
-                warnings=warnings,
-            )
-
-        # 非 bash 或非 git：走逐文件手动恢复
+        # 统一走逐文件手动恢复，避免 console 使用 git checkout 误伤已有脏文件。
         for snapshot in cp.file_snapshots:
             path = Path(snapshot.path)
             try:
@@ -429,8 +408,215 @@ class CheckpointManager:
     @staticmethod
     def _is_readonly_command(command: str) -> bool:
         """判断是否只读命令。"""
-        cmd = command.strip()
+        cmd = command.strip().lower()
+        if not cmd:
+            return True
+        for blocker in _READONLY_BLOCKERS:
+            if blocker in cmd:
+                return False
         for prefix in _READONLY_PREFIXES:
             if cmd.startswith(prefix):
                 return True
         return False
+
+    async def _capture_console_baseline(self) -> dict[str, _ConsoleFileState]:
+        """捕获命令执行前工作区中已脏路径的真实状态。"""
+        modified, deleted, untracked = await self._git_list_dirty_paths()
+        baseline: dict[str, _ConsoleFileState] = {}
+        for rel_path in sorted(modified | deleted | untracked):
+            baseline[rel_path] = self._read_console_file_state(
+                self._absolute_from_relative(rel_path)
+            )
+        return baseline
+
+    async def _build_console_snapshots(
+        self,
+        baseline: dict[str, _ConsoleFileState],
+    ) -> list[FileSnapshot]:
+        """基于命令前后工作区差异构建可精确回滚的文件快照。"""
+        modified, deleted, untracked = await self._git_list_dirty_paths()
+        snapshots: list[FileSnapshot] = []
+        candidate_paths = sorted(set(baseline) | modified | deleted | untracked)
+
+        for rel_path in candidate_paths:
+            before = baseline.get(rel_path)
+            current = self._read_console_file_state(
+                self._absolute_from_relative(rel_path)
+            )
+
+            if before is not None:
+                if self._console_state_equal(before, current):
+                    continue
+                snapshots.append(self._snapshot_from_console_baseline(rel_path, before, current))
+                continue
+
+            # 不在 baseline 中，说明命令前它是干净 tracked 文件或根本不存在。
+            if rel_path in untracked:
+                if current.exists:
+                    snapshots.append(FileSnapshot(
+                        path=str(self._absolute_from_relative(rel_path)),
+                        action="create",
+                        original_content=None,
+                        original_mode=None,
+                    ))
+                continue
+
+            if rel_path in modified or rel_path in deleted:
+                original_content = await self._read_git_tracked_content(rel_path)
+                original_mode = await self._read_git_tracked_mode(rel_path)
+                snapshots.append(FileSnapshot(
+                    path=str(self._absolute_from_relative(rel_path)),
+                    action="delete" if rel_path in deleted else "modify",
+                    original_content=original_content,
+                    original_mode=original_mode,
+                ))
+
+        return snapshots
+
+    async def _git_list_dirty_paths(self) -> tuple[set[str], set[str], set[str]]:
+        """列出 git 工作区中的 modified / deleted / untracked 路径。"""
+        modified = set(await self._run_git_path_list("ls-files", "-m", "-z"))
+        deleted = set(await self._run_git_path_list("ls-files", "-d", "-z"))
+        untracked = set(await self._run_git_path_list(
+            "ls-files", "-o", "--exclude-standard", "-z"
+        ))
+        return modified, deleted, untracked
+
+    async def _run_git_path_list(self, *args: str) -> list[str]:
+        """执行 git 命令并解析 NUL 分隔的相对路径列表。"""
+        import asyncio
+
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self._working_dir,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+        if process.returncode != 0 or not stdout:
+            return []
+        return [
+            item
+            for item in stdout.decode("utf-8", errors="replace").split("\x00")
+            if item
+        ]
+
+    async def _read_git_tracked_content(self, rel_path: str) -> bytes | None:
+        """读取 git index 中的 tracked 文件内容。"""
+        import asyncio
+
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "show",
+            f":{rel_path}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self._working_dir,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+        if process.returncode != 0:
+            return None
+        return stdout
+
+    async def _read_git_tracked_mode(self, rel_path: str) -> int | None:
+        """读取 git index 中的 tracked 文件 mode。"""
+        import asyncio
+
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-files",
+            "--stage",
+            "--",
+            rel_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self._working_dir,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+        if process.returncode != 0 or not stdout:
+            return None
+        line = stdout.decode("utf-8", errors="replace").splitlines()[0].strip()
+        if not line:
+            return None
+        try:
+            mode_text = line.split()[0]
+            return int(mode_text, 8)
+        except (ValueError, IndexError):
+            return None
+
+    def _read_console_file_state(self, path: Path) -> _ConsoleFileState:
+        """读取当前文件状态。"""
+        try:
+            exists = path.exists()
+        except OSError:
+            exists = False
+
+        if not exists:
+            return _ConsoleFileState(
+                path=str(path),
+                exists=False,
+                content=None,
+                mode=None,
+            )
+
+        try:
+            content = path.read_bytes()
+        except OSError:
+            content = None
+        try:
+            mode = path.stat().st_mode
+        except OSError:
+            mode = None
+
+        return _ConsoleFileState(
+            path=str(path),
+            exists=True,
+            content=content,
+            mode=mode,
+        )
+
+    def _absolute_from_relative(self, rel_path: str) -> Path:
+        """将 git 相对路径转换为工作目录内绝对路径。"""
+        return (Path(self._working_dir) / Path(rel_path)).resolve()
+
+    @staticmethod
+    def _console_state_equal(
+        before: _ConsoleFileState,
+        current: _ConsoleFileState,
+    ) -> bool:
+        """判断命令前后的文件状态是否一致。"""
+        return (
+            before.exists == current.exists
+            and before.content == current.content
+            and before.mode == current.mode
+        )
+
+    def _snapshot_from_console_baseline(
+        self,
+        rel_path: str,
+        before: _ConsoleFileState,
+        current: _ConsoleFileState,
+    ) -> FileSnapshot:
+        """根据命令前状态生成该路径的可回滚快照。"""
+        abs_path = str(self._absolute_from_relative(rel_path))
+        if not before.exists:
+            return FileSnapshot(
+                path=abs_path,
+                action="create",
+                original_content=None,
+                original_mode=None,
+            )
+        if not current.exists:
+            return FileSnapshot(
+                path=abs_path,
+                action="delete",
+                original_content=before.content,
+                original_mode=before.mode,
+            )
+        return FileSnapshot(
+            path=abs_path,
+            action="modify",
+            original_content=before.content,
+            original_mode=before.mode,
+        )

@@ -1,7 +1,7 @@
 """文件变更追踪暂存区。
 
 Coder Agent 的 write/edit 会先登记原始内容，再立刻 materialize 到真实磁盘，
-保证 bash/read/edit/write 看到的是同一份工作区视图。
+保证 console/read/edit/write 看到的是同一份工作区视图。
 
 暂存区的职责变为：
 1. 记录每个被 write/edit 触碰文件的初始内容
@@ -84,7 +84,7 @@ class FileStagingArea:
     生命周期：
     1. CoderAgent.execute() 开始时创建并挂到 session.staging_area
     2. write/edit 工具检测到暂存区存在时先登记原始内容，再直接写入磁盘
-    3. read/bash 等工具始终读取同一份真实磁盘内容
+    3. read/console 等工具始终读取同一份真实磁盘内容
     4. Coder 成功 → commit() 基于初始内容与当前磁盘状态生成最终 diff
     5. Coder 失败/异常 → rollback() 恢复已追踪文件
     """
@@ -203,7 +203,7 @@ class FileStagingArea:
         return action
 
     def get_staged_content(self, path: str) -> str | None:
-        """获取已追踪文件当前内容。优先以磁盘为准，避免与 bash 视图分叉。"""
+        """获取已追踪文件当前内容。优先以磁盘为准，避免与 console 视图分叉。"""
         staged = self._staged.get(path)
         if staged is not None:
             target = Path(path)

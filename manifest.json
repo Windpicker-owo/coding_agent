@@ -22,7 +22,7 @@
         {"component_type": "chatter", "component_name": "coding_agent", "dependencies": []},
         {"component_type": "adapter", "component_name": "coding_agent_adapter", "dependencies": []},
         {"component_type": "service", "component_name": "project_context", "dependencies": []},
-        {"component_type": "tool", "component_name": "bash", "dependencies": []},
+        {"component_type": "tool", "component_name": "console", "dependencies": []},
         {"component_type": "tool", "component_name": "read", "dependencies": []},
         {"component_type": "tool", "component_name": "write", "dependencies": []},
         {"component_type": "tool", "component_name": "edit", "dependencies": []},

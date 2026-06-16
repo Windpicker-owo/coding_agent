@@ -1,6 +1,6 @@
 """Coding Agent 工具组件。"""
 
-from .bash import BashTool
+from .console import ConsoleTool
 from .read import ReadTool
 from .write import WriteTool
 from .edit import EditTool
@@ -9,9 +9,11 @@ from .find import FindTool
 from .ls import LsTool
 from .create_plan import CreatePlanTool
 from .implement_plan import ImplementPlanTool
+from .enter_phase import EnterPhaseTool
 
 __all__ = [
-    "BashTool", "ReadTool", "WriteTool", "EditTool",
+    "ConsoleTool", "ReadTool", "WriteTool", "EditTool",
     "GrepTool", "FindTool", "LsTool",
     "CreatePlanTool", "ImplementPlanTool",
+    "EnterPhaseTool",
 ]

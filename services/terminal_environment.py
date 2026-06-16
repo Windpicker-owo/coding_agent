@@ -10,8 +10,8 @@ import shutil
 def get_preferred_terminal_from_config(config: object | None) -> str:
     """从插件配置中读取优先终端环境。"""
 
-    bash_config = getattr(config, "bash", None) if config is not None else None
-    preferred = getattr(bash_config, "preferred_terminal", "") if bash_config is not None else ""
+    console_config = getattr(config, "console", None) if config is not None else None
+    preferred = getattr(console_config, "preferred_terminal", "") if console_config is not None else ""
     return str(preferred or "").strip()
 
 
