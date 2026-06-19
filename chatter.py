@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from typing import Any, AsyncGenerator, cast
 
@@ -14,7 +13,7 @@ from src.app.plugin_system.types import ChatType
 
 from src.app.plugin_system.api.prompt_api import add_system_reminder, get_template
 from src.core.config import get_model_config
-from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, ToolResult, ToolRegistry, LLMContextManager, ReminderSourceSpec
+from src.kernel.llm import LLMPayload, LLMRequest, ROLE, Text, Image, ToolResult, ToolRegistry, LLMContextManager, ReminderSourceSpec
 from src.kernel.logger import get_logger, COLOR
 
 from .config import CodingAgentConfig
@@ -71,6 +70,10 @@ class CodingAgentChatter(BaseChatter):
         if session is None:
             yield Failure("无法获取 Coding Agent 会话")
             return
+
+        # 注册跳过内置 VLM 识别：让 coding agent 自行处理图片多模态
+        from src.core.managers.media_manager import get_media_manager
+        get_media_manager().skip_vlm_for_stream(self.stream_id, media_types=("image",))
 
         project_root = session.working_directory
 
@@ -186,7 +189,7 @@ class CodingAgentChatter(BaseChatter):
                 if unreads:
                     self._goal_review_pending = False
                     await self.flush_unreads(unreads)
-                    current.add_payload(LLMPayload(ROLE.USER, Text(unreads_text)))
+                    current.add_payload(LLMPayload(ROLE.USER, self._build_user_content(unreads_text, unreads)))
                     self._is_first_message = False
                     self._message_count += 1
                     is_first = False
@@ -197,76 +200,7 @@ class CodingAgentChatter(BaseChatter):
                     self._goal_round_modified = False  # 重置本轮修改标记
 
                     # 构建全新的干净上下文，不受前面对话影响
-                    # 支持模型覆盖：solo 模式用 solo_model，否则用 main_model
-                    goal_model_name = ""
-                    if session.solo_mode:
-                        goal_model_name = session.solo_model or ""
-                    else:
-                        goal_model_name = session.main_model or ""
-
-                    if goal_model_name:
-                        try:
-                            model_set = get_model_config().get_model_set_by_name(goal_model_name)
-                        except KeyError:
-                            logger.warning(f"目标审查模型 '{goal_model_name}' 不存在，回退到 task 方式")
-                            current = self.create_request(
-                                task=self._get_model_task("main_task", "coding_main"),
-                                request_name="coding_goal_review",
-                                with_reminder="code_main_agent",
-                            )
-                            current.context_manager.context_compression_handler = (
-                                coding_context_compression_handler
-                            )
-                        else:
-                            context_manager = LLMContextManager(
-                                context_compression_handler=coding_context_compression_handler,
-                                reminder_sources=[
-                                    ReminderSourceSpec(
-                                        bucket="code_main_agent",
-                                        wrap_with_system_tag=True,
-                                    )
-                                ],
-                            )
-                            current = LLMRequest(
-                                model_set=model_set,
-                                request_name="coding_goal_review",
-                                meta_data={"stream_id": self.stream_id},
-                                context_manager=context_manager,
-                            )
-                    else:
-                        current = self.create_request(
-                            task=self._get_model_task("main_task", "coding_main"),
-                            request_name="coding_goal_review",
-                            with_reminder="code_main_agent",
-                        )
-                        current.context_manager.context_compression_handler = (
-                            coding_context_compression_handler
-                        )
-                    current.add_payload(LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(
-                        solo_mode=session.solo_mode,
-                    ))))
-                    current.add_payload(LLMPayload(ROLE.USER, Text(
-                        self._build_goal_review_prompt(session.goal_text, session.goal_doc_path)
-                    )))
-
-                    # 注册工具
-                    registry = ToolRegistry()
-                    if session.solo_mode:
-                        for tool_cls in [
-                            ConsoleTool, ReadTool, WriteTool, EditTool,
-                        ]:
-                            registry.register(tool_cls)
-                    else:
-                        for tool_cls in [
-                            ConsoleTool, ReadTool, WriteTool, EditTool,
-                            CreatePlanTool, ImplementPlanTool,
-                        ]:
-                            registry.register(tool_cls)
-                    for tool_cls in get_mcp_tools_for_agent(self.plugin, "main"):
-                        registry.register(tool_cls)
-                    tool_schemas = registry.get_all()
-                    if tool_schemas:
-                        current.add_payload(LLMPayload(ROLE.TOOL, tool_schemas))  # type: ignore[arg-type]
+                    current, registry = await self._build_goal_review_request(session)
 
                     self._is_first_message = False
                     self._message_count += 1
@@ -290,12 +224,15 @@ class CodingAgentChatter(BaseChatter):
                 self._is_first_message = False
                 self._message_count += 1
 
-                # 添加用户消息
-                current.add_payload(LLMPayload(ROLE.USER, Text(unreads_text)))
+                # 添加用户消息（含图片多模态）
+                current.add_payload(LLMPayload(ROLE.USER, self._build_user_content(unreads_text, unreads)))
 
                 # 首条消息立即启动标题生成（fire-and-forget，不等待 LLM 响应）
                 if is_first:
-                    asyncio.create_task(self._generate_title(session_id, unreads_text))
+                    task = asyncio.create_task(self._generate_title(session_id, unreads_text))
+                    task.add_done_callback(
+                        lambda t: logger.error(f"标题生成任务失败: {t.exception()}") if not t.cancelled() and t.exception() else None
+                    )
 
                 await self._notify_status("thinking", "正在分析...")
 
@@ -323,7 +260,8 @@ class CodingAgentChatter(BaseChatter):
                     f"LLM 响应完成: chunks={chunk_count}, "
                     f"message={current.message!r:.80}, "
                     f"tool_calls={len(current.call_list) if current.call_list else 0}, "
-                    f"has_thinking={bool(current.reasoning_content)}"
+                    f"has_thinking={bool(current.reasoning_content)}, "
+                    f"stop_reason={current.stop_reason!r}"
                 )
 
                 # 推送上下文用量到前端
@@ -423,7 +361,10 @@ class CodingAgentChatter(BaseChatter):
                 self._current_request = current
                 self._record_final_agent_marker(session_id, payloads_data)
                 # 自动保存会话状态（fire-and-forget）
-                asyncio.create_task(self._auto_save(session_id))
+                task = asyncio.create_task(self._auto_save(session_id))
+                task.add_done_callback(
+                    lambda t: logger.error(f"自动保存任务失败: {t.exception()}") if not t.cancelled() and t.exception() else None
+                )
 
             # ── Goal 模式完成检查 ──
             session = session_mgr.get_session(session_id)
@@ -450,6 +391,156 @@ class CodingAgentChatter(BaseChatter):
                     continue
             else:
                 await self._notify_status("ready", "等待输入")
+
+    # ── 多模态用户内容构建 ────────────────────────────────
+
+    @staticmethod
+    def _extract_images_from_messages(
+        messages: list[Any],
+    ) -> list[dict[str, str]]:
+        """从消息列表中提取所有图片媒体项。
+
+        Args:
+            messages: Message 对象列表
+
+        Returns:
+            图片项列表，每项为 ``{"type": "image", "data": "<base64>"}``
+        """
+        images: list[dict[str, str]] = []
+        for msg in messages:
+            # 优先从 content dict 中提取
+            content = getattr(msg, "content", None)
+            if isinstance(content, dict):
+                for m in content.get("media", []):
+                    if m.get("type") == "image" and m.get("data"):
+                        images.append(m)
+                continue
+            # 回退：从 extra 中提取
+            extra = getattr(msg, "extra", {})
+            for m in extra.get("media", []):
+                if m.get("type") == "image" and m.get("data"):
+                    images.append(m)
+        return images
+
+    def _build_user_content(
+        self,
+        text: str,
+        messages: list[Any],
+    ) -> list[Any]:
+        """构建包含图片的多模态用户内容。
+
+        若消息中包含图片，则返回 ``[Text, Image, ...]`` 列表；
+        否则返回纯 ``[Text]`` 列表。
+
+        Args:
+            text: 格式化后的用户消息文本
+            messages: 原始 Message 对象列表
+
+        Returns:
+            可直接作为 ``LLMPayload`` content 的内容列表
+        """
+        content: list[Any] = [Text(text)]
+        images = self._extract_images_from_messages(messages)
+        for img in images:
+            try:
+                content.append(Image(img["data"]))
+            except Exception as e:
+                logger.warning(f"构建 Image 内容失败: {e}")
+        return content
+
+    # ── Goal 审查请求构建 ───────────────────────────────────
+
+    async def _build_goal_review_request(
+        self, session: Any,
+    ) -> tuple[Any, ToolRegistry]:
+        """构建 goal 审查轮的全新 LLM 请求和工具注册表。
+
+        支持模型覆盖：solo 模式用 solo_model，否则用 main_model。
+        如果指定模型不存在则回退到 task 方式。
+
+        Args:
+            session: 当前 CodingSession 实例。
+
+        Returns:
+            tuple: (LLMRequest 实例, ToolRegistry 实例)。
+        """
+        # 支持模型覆盖：solo 模式用 solo_model，否则用 main_model
+        goal_model_name = ""
+        if session.solo_mode:
+            goal_model_name = session.solo_model or ""
+        else:
+            goal_model_name = session.main_model or ""
+
+        if goal_model_name:
+            try:
+                task_name = self._get_model_task("main_task", "coding_main")
+                task_cfg = get_model_config().model_tasks.get_task(task_name)
+                model_set = get_model_config().get_model_set_by_name(
+                    goal_model_name, max_tokens=task_cfg.max_tokens
+                )
+            except KeyError:
+                logger.warning(f"目标审查模型 '{goal_model_name}' 不存在，回退到 task 方式")
+                current = self.create_request(
+                    task=self._get_model_task("main_task", "coding_main"),
+                    request_name="coding_goal_review",
+                    with_reminder="code_main_agent",
+                )
+                current.context_manager.context_compression_handler = (
+                    coding_context_compression_handler
+                )
+            else:
+                context_manager = LLMContextManager(
+                    context_compression_handler=coding_context_compression_handler,
+                    reminder_sources=[
+                        ReminderSourceSpec(
+                            bucket="code_main_agent",
+                            wrap_with_system_tag=True,
+                        )
+                    ],
+                )
+                current = LLMRequest(
+                    model_set=model_set,
+                    request_name="coding_goal_review",
+                    meta_data={"stream_id": self.stream_id},
+                    context_manager=context_manager,
+                )
+        else:
+            current = self.create_request(
+                task=self._get_model_task("main_task", "coding_main"),
+                request_name="coding_goal_review",
+                with_reminder="code_main_agent",
+            )
+            current.context_manager.context_compression_handler = (
+                coding_context_compression_handler
+            )
+
+        current.add_payload(LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(
+            solo_mode=session.solo_mode,
+        ))))
+        current.add_payload(LLMPayload(ROLE.USER, Text(
+            self._build_goal_review_prompt(session.goal_text, session.goal_doc_path)
+        )))
+
+        # 注册工具
+        registry = ToolRegistry()
+        if session.solo_mode:
+            for tool_cls in [
+                ConsoleTool, ReadTool, WriteTool, EditTool,
+            ]:
+                registry.register(tool_cls)
+        else:
+            for tool_cls in [
+                ConsoleTool, ReadTool, WriteTool, EditTool,
+                CreatePlanTool, ImplementPlanTool,
+            ]:
+                registry.register(tool_cls)
+        for tool_cls in get_mcp_tools_for_agent(self.plugin, "main"):
+            registry.register(tool_cls)
+        tool_schemas = registry.get_all()
+        if tool_schemas:
+            current.add_payload(LLMPayload(ROLE.TOOL, tool_schemas))  # type: ignore[arg-type]
+
+        return current, registry
 
     # ── 自动保存 ───────────────────────────────────────────
 
@@ -706,7 +797,8 @@ class CodingAgentChatter(BaseChatter):
         """构建干净的主 agent 请求。"""
         # 只有当 project_context 有效时才设置 reminder
         if project_context and isinstance(project_context, dict):
-            ctx_text = json.dumps(project_context, indent=2, ensure_ascii=False)
+            context_svc = ProjectContextService(self.plugin)
+            ctx_text = await context_svc.format_context_as_text(project_context)
             reminder_content = f"<project_context>\n{ctx_text}\n</project_context>"
             # Main Agent 槽位
             add_system_reminder(
@@ -759,7 +851,11 @@ class CodingAgentChatter(BaseChatter):
         used_direct_model = False
         if main_model_name:
             try:
-                model_set = get_model_config().get_model_set_by_name(main_model_name)
+                task_name = self._get_model_task("main_task", "coding_main")
+                task_cfg = get_model_config().model_tasks.get_task(task_name)
+                model_set = get_model_config().get_model_set_by_name(
+                    main_model_name, max_tokens=task_cfg.max_tokens
+                )
             except KeyError:
                 logger.warning(f"main_model '{main_model_name}' 在 models 列表中不存在，回退到 task 方式")
                 request = self.create_request(
@@ -830,7 +926,11 @@ class CodingAgentChatter(BaseChatter):
 
         if model_name:
             try:
-                model_set = get_model_config().get_model_set_by_name(model_name)
+                task_name = self._get_model_task("main_task", "coding_main")
+                task_cfg = get_model_config().model_tasks.get_task(task_name)
+                model_set = get_model_config().get_model_set_by_name(
+                    model_name, max_tokens=task_cfg.max_tokens
+                )
             except KeyError:
                 # 模型名不存在，可能是旧 session 的 task 名，回退到 task 方式
                 logger.warning(f"模型 '{model_name}' 在 models 列表中不存在，尝试作为 task 名解析")
@@ -1014,10 +1114,17 @@ class CodingAgentChatter(BaseChatter):
                     },
                 })
 
-            # 启动 guidance 转发后台任务（供 implement_plan 内部的 CoderAgent 消费）
-            forward_task = asyncio.create_task(
-                self._forward_guidance_to_coder(session_id)
+            # 仅当存在 implement_plan 调用时才启动 guidance 转发后台任务
+            # （供 CoderAgent 在工具轮次间消费）；不存在时跳过，
+            # 由下方 L1050 fetch_unreads() 处理引导消息。
+            has_implement_plan = any(
+                call.name == "implement_plan" for call in calls
             )
+            forward_task = None
+            if has_implement_plan:
+                forward_task = asyncio.create_task(
+                    self._forward_guidance_to_coder(session_id)
+                )
             try:
                 # 执行工具，结果会写入 response 的 TOOL_RESULT payload
                 await self.run_tool_call(
@@ -1028,17 +1135,18 @@ class CodingAgentChatter(BaseChatter):
                     task_observer=task_observer,
                 )
             finally:
-                forward_task.cancel()
-                try:
-                    await forward_task
-                except asyncio.CancelledError:
-                    pass
+                if forward_task is not None:
+                    forward_task.cancel()
+                    try:
+                        await forward_task
+                    except asyncio.CancelledError:
+                        pass
 
             # 工具轮次之间主动接入工作中追加的用户消息，避免“引导无效直到回合结束”。
             follow_up_text, follow_up_unreads = await self.fetch_unreads()
             if follow_up_unreads:
                 await self.flush_unreads(follow_up_unreads)
-                response.add_payload(LLMPayload(ROLE.USER, Text(follow_up_text)))
+                response.add_payload(LLMPayload(ROLE.USER, self._build_user_content(follow_up_text, follow_up_unreads)))
                 trigger_msg = follow_up_unreads[-1]
                 await self._notify_status(
                     "coding",
@@ -1101,7 +1209,8 @@ class CodingAgentChatter(BaseChatter):
 
             logger.debug(
                 f"工具后续响应: round={round_num}, chunks={chunk_count}, "
-                f"tool_calls={len(response.call_list) if response.call_list else 0}"
+                f"tool_calls={len(response.call_list) if response.call_list else 0}, "
+                f"stop_reason={response.stop_reason!r}"
             )
 
             silent_tool_rounds = advance_silent_tool_rounds(

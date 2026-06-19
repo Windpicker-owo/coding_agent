@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import aiofiles
 from typing import Annotated
 
@@ -11,6 +12,21 @@ from src.kernel.logger import get_logger
 from .base import CodingToolMixin
 
 logger = get_logger("coding_agent.read")
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".tiff", ".tif"}
+
+MIME_MAP = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+}
 
 
 class ReadTool(CodingToolMixin, BaseTool):
@@ -84,6 +100,22 @@ class ReadTool(CodingToolMixin, BaseTool):
 
         if not target.is_file():
             return False, f"路径不是文件: {target}"
+
+        # 检测图像文件：读取为 base64 返回
+        suffix = target.suffix.lower()
+        if suffix in IMAGE_EXTENSIONS:
+            try:
+                async with aiofiles.open(target, "rb") as f:
+                    raw_bytes = await f.read()
+                encoded = base64.b64encode(raw_bytes).decode("ascii")
+                mime = MIME_MAP.get(suffix, "image/png")
+                size_kb = len(raw_bytes) / 1024
+                return True, (
+                    f"图像文件 {path} ({size_kb:.1f} KB, {mime}):\n"
+                    f"data:{mime};base64,{encoded}"
+                )
+            except OSError as e:
+                return False, f"读取图像文件失败: {e}"
 
         # 检测二进制文件
         try:

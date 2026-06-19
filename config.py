@@ -52,7 +52,7 @@ class CodingAgentConfig(BaseConfig):
     @config_section("ws", title="WebSocket 适配器", tag="network")
     class WsSection(SectionBase):
         """WebSocket 适配器配置。"""
-        host: str = Field(default="0.0.0.0", description="监听地址")
+        host: str = Field(default="0.0.0.0", description="监听地址（⚠️ 0.0.0.0 表示监听所有网卡，仅适用于桌面 localhost 场景；生产环境应改为 127.0.0.1）")
         port: int = Field(default=8765, description="监听端口")
         path: str = Field(default="/coding-agent/ws", description="WebSocket 路径")
         tui_username: str = Field(default="User", description="客户端显示的用户名")

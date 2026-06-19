@@ -75,9 +75,8 @@ class ModuleResearcherAgent(BaseAgent):
         request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
 
         # 多轮工具调用循环
-        max_iterations = 30
-        for _ in range(max_iterations):
-            response = await request.send(stream=False)
+        while True:
+            response = await request.send(stream=True)
             await response
 
             if response.call_list:

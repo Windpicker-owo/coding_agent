@@ -604,6 +604,10 @@ class FileStagingArea:
             current = current_workspace.get(path)
             original_content = baseline.content if baseline is not None else None
             final_content = current.content if current is not None else None
+            # O(1) 快速路径：先比较长度，不同则内容必定不同，跳过昂贵的字符串比较
+            if final_content is not None and original_content is not None:
+                if len(final_content) != len(original_content):
+                    continue
             if final_content == original_content:
                 continue
 

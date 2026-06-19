@@ -12,8 +12,7 @@ def build_retry_profiles(requested_profile: str) -> list[str]:
     profiles: list[str] = []
     if normalized:
         profiles.append(normalized)
-    if not profiles or profiles[-1] != "":
-        profiles.append("")
+    profiles.append("")  # 空字符串表示 fallback 到默认模型
     return profiles
 
 

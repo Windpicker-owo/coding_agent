@@ -34,6 +34,7 @@ class CodingAgentPlugin(BasePlugin):
 
     plugin_name = "coding_agent"
     plugin_description = "类 Claude Code 的编程智能体，前后端分离架构"
+    # 注意：此版本号需与 manifest.json 中的 version 保持同步
     plugin_version = "0.1.0"
 
     configs = [CodingAgentConfig]

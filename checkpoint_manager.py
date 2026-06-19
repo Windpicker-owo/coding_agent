@@ -3,11 +3,31 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
+
+
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+def _hidden_subprocess_kwargs() -> dict[str, object]:
+    """构造 Windows 下隐藏控制台窗口所需的启动参数。"""
+
+    if sys.platform != "win32":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": _CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
 
 
 @dataclass
@@ -492,6 +512,7 @@ class CheckpointManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._working_dir,
+            **_hidden_subprocess_kwargs(),
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
         if process.returncode != 0 or not stdout:
@@ -513,6 +534,7 @@ class CheckpointManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._working_dir,
+            **_hidden_subprocess_kwargs(),
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
         if process.returncode != 0:
@@ -532,6 +554,7 @@ class CheckpointManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._working_dir,
+            **_hidden_subprocess_kwargs(),
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
         if process.returncode != 0 or not stdout:

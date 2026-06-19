@@ -9,6 +9,8 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import re
+import string as _string_module
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -128,9 +130,15 @@ class CodingAgentAdapter(BaseAdapter):
         async def handler(ws: Any) -> None:
             # 新版 websockets.asyncio.server: path 通过 ws.request.path 访问
             ws_path = getattr(getattr(ws, "request", None), "path", None) or getattr(ws, "path", "/")
+            print(f"[DEBUG] WS 握手请求 path={ws_path!r}, expected={path!r}")
+            logger.info(f"WS 握手请求 path={ws_path!r}")
             if ws_path != path:
+                print(f"[DEBUG] WS path 不匹配: expected={path!r} actual={ws_path!r}")
+                logger.warning(f"WS path 不匹配: expected={path!r} actual={ws_path!r}")
                 await ws.close(code=4000, reason="Path mismatch")
                 return
+            
+            print(f"[DEBUG] Handshake successful, calling _handle_connection")
             await self._handle_connection(ws)
 
         self._ws_server = await ws_serve(
@@ -148,6 +156,7 @@ class CodingAgentAdapter(BaseAdapter):
         """处理单个 TUI WebSocket 连接的完整生命周期。"""
         conn_id = str(uuid4())
         self._connections[conn_id] = ws
+        logger.info(f"TUI 连接接入: {conn_id[:8]}")
         try:
             async for raw in ws:
                 try:
@@ -183,8 +192,14 @@ class CodingAgentAdapter(BaseAdapter):
         # ── 打开项目 ──
         if msg_type == "project.open":
             payload = raw.get("payload", {})
-            working_directory = payload.get("working_directory", ".")
+            working_directory = str(Path(payload.get("working_directory", ".")).resolve())
             
+            try:
+                import os
+                os.chdir(working_directory)
+            except Exception as e:
+                logger.error(f"无法切换工作目录到 {working_directory}: {e}")
+
             # 清理该连接关联的所有旧会话（切换项目，全部重置）
             for sid in session_mgr.get_session_ids_by_conn(conn_id):
                 await session_mgr.destroy_session(sid)
@@ -193,7 +208,7 @@ class CodingAgentAdapter(BaseAdapter):
                 self._session_ws.pop(old_session_id, None)
 
             summaries = await session_mgr.list_sessions(working_directory)
-            project_name = working_directory.rstrip("/\\").split("/")[-1] or working_directory.rstrip("/\\").split("\\")[-1]
+            project_name = Path(working_directory).name
             
             ws = self._connections.get(conn_id)
             if ws:
@@ -225,6 +240,24 @@ class CodingAgentAdapter(BaseAdapter):
 
             ws = self._connections.get(conn_id)
             if not ws:
+                return
+
+            # Windows: 根路径返回盘符列表
+            if sys.platform == "win32" and str(browse_path) in ("/", "", "."):
+                drives = []
+                for letter in _string_module.ascii_uppercase:
+                    drive = f"{letter}:\\"
+                    if Path(drive).exists():
+                        drives.append({"name": drive, "is_dir": True})
+                msg = {
+                    "type": "browse.directory_result",
+                    "payload": {
+                        "path": "根目录",
+                        "parent": None,
+                        "entries": drives,
+                    },
+                }
+                await ws.send(json.dumps(msg, ensure_ascii=False))
                 return
 
             try:
@@ -262,7 +295,13 @@ class CodingAgentAdapter(BaseAdapter):
         # ── 会话初始化 ──
         if msg_type == "session.init":
             payload = raw.get("payload", {})
-            working_directory = payload.get("working_directory", ".")
+            working_directory = str(Path(payload.get("working_directory", ".")).resolve())
+            
+            try:
+                os.chdir(working_directory)
+            except Exception as e:
+                pass
+
             session_id = payload.get("session_id", "")
             solo_mode = payload.get("solo_mode", False)
             solo_model = payload.get("solo_model", "")
@@ -331,6 +370,37 @@ class CodingAgentAdapter(BaseAdapter):
             await ws.send(json.dumps({
                 "type": "model.list_result",
                 "payload": {"models": model_names},
+                "id": raw.get("id", ""),
+            }, ensure_ascii=False))
+            return
+
+        if msg_type == "session.list_multi":
+            ws = self._connections.get(conn_id)
+            if not ws:
+                return
+            payload = raw.get("payload", {})
+            directories = payload.get("directories", [])
+            results = {}
+            for d in directories:
+                try:
+                    summaries = await session_mgr.list_sessions(d)
+                    results[d] = [
+                        {
+                            "session_id": s.session_id,
+                            "title": s.title,
+                            "created_at": s.created_at,
+                            "last_active_at": s.last_active_at,
+                            "message_count": s.message_count,
+                            "phase": s.phase,
+                        }
+                        for s in summaries
+                    ]
+                except Exception:
+                    results[d] = []
+            
+            await ws.send(json.dumps({
+                "type": "session.list_multi_result",
+                "payload": {"projects": results},
                 "id": raw.get("id", ""),
             }, ensure_ascii=False))
             return
@@ -423,6 +493,9 @@ class CodingAgentAdapter(BaseAdapter):
                 from src.core.transport.message_receive.utils import extract_stream_id
                 stream_id = extract_stream_id(envelope["message_info"])
                 session_mgr.bind_stream_id(session_id=session.id, stream_id=stream_id)
+                # 跳过内置 VLM 识别：coding agent 自行处理图片多模态
+                from src.core.managers.media_manager import get_media_manager
+                get_media_manager().skip_vlm_for_stream(stream_id, media_types=("image",))
                 await self.core_sink.send(envelope)
 
         elif msg_type == "session.list":
@@ -607,11 +680,12 @@ class CodingAgentAdapter(BaseAdapter):
         """将 user.message 转为标准 MessageEnvelope。
 
         使用 session_id 作为 user_id，确保每个 session 拥有独立的聊天流，
-        避免多 session 之间状态污染。
+        避免多 session 之间状态污染。支持 images 字段（base64 data URL 数组）构建多模态消息。
         """
         payload = raw.get("payload", {})
         content = payload.get("content", "")
-        if not content:
+        images: list[str] = payload.get("images", [])
+        if not content and not images:
             return None
 
         kind = str(payload.get("kind", "message") or "message").strip().lower()
@@ -628,9 +702,12 @@ class CodingAgentAdapter(BaseAdapter):
             platform="coding_agent",
             nickname=self._tui_username,
         )
-        builder.text(content)
+        if content:
+            builder.text(content)
+        for img_data_url in images:
+            builder.image(img_data_url)
         builder.format_info(
-            content_format=["text"],
+            content_format=["text", "image"] if images else ["text"],
             accept_format=["text", "markdown"],
         )
 

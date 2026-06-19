@@ -131,76 +131,187 @@ class ProjectContextService(BaseService):
         return "未检测到"
 
     async def format_context_as_text(self, context: dict) -> str:
-        """把 context dict 格式化为人/LLM 可读的摘要文本。
-        
+        """把 context dict 格式化为人/LLM 可读的 Markdown 文本。
+
         用于 user 消息和 system reminder 共用。
         兼容两种 context 结构：
         1. 平铺结构（顶层 project_name / tech_stack / modules 等）
         2. 嵌套结构（顶层 scout + modules 研究列表）
+
+        输出结构化的 Markdown，包含项目概览和每个成功研究模块的详细报告，
+        避免 JSON 语法开销（引号/逗号/括号），减少 token 消耗并提升模型理解能力。
         """
         if not context:
             return "（项目上下文为空）"
-        
+
         # 从嵌套结构中提取 scout（若存在）
         scout = context.get("scout", {}) if isinstance(context.get("scout"), dict) else {}
-        
+
         def _get(key: str, default: Any = None) -> Any:
             """优先从顶层取，降级到 scout 子 dict。"""
             val = context.get(key)
             if val is not None:
                 return val
             return scout.get(key, default)
-        
+
         lines: list[str] = []
-        
-        # 项目基本信息
+
+        # ── 标题 ──
         project_name = _get("project_name", "未知项目")
-        lines.append(f"项目名称: {project_name}")
-        
+        lines.append(f"## 项目上下文: {project_name}")
+        lines.append("")
+
+        # ── 概览 ──
+        lines.append("### 概览")
+
         # 技术栈
         tech_stack = _get("tech_stack", [])
         if tech_stack:
-            lines.append(f"技术栈: {', '.join(tech_stack[:10])}")  # 最多显示10个
-        
-        # 虚拟环境
-        virtual_env = context.get("virtual_environment") or scout.get("virtual_environment", "未检测到")
-        if virtual_env and virtual_env != "未检测到":
-            lines.append(f"虚拟环境: {virtual_env}")
-        
-        # 构建系统
-        build_system = _get("build_system", "")
-        if build_system:
-            lines.append(f"构建系统: {build_system}")
-        
-        # 模块数量 — 优先使用嵌套 modules 研究列表，降级到 scout.modules
-        nested_modules = context.get("modules", [])
-        scout_modules = scout.get("modules", [])
-        if nested_modules:
-            lines.append(f"模块数量: {len(nested_modules)} (含深度研究)")
-        elif scout_modules:
-            lines.append(f"模块数量: {len(scout_modules)}")
-        
-        # 配置文件
-        config_files = _get("config_files", [])
-        if config_files:
-            lines.append(f"配置文件: {len(config_files)} 个")
-        
-        # 关键文件
-        key_files = _get("key_files", [])
-        if key_files:
-            lines.append(f"关键文件: {len(key_files)} 个")
-        
+            lines.append(f"- **技术栈:** {', '.join(tech_stack[:10])}")
+
         # 源代码根目录
         source_root = _get("source_root", "")
         if source_root:
-            lines.append(f"源代码根目录: {source_root}")
-        
-        # 摘要 — 优先 scout.summary，降级到顶层 summary
-        summary = scout.get("summary") or context.get("summary", "")
-        if summary:
-            # 限制摘要长度
-            if len(summary) > 500:
-                summary = summary[:500] + "..."
-            lines.append(f"项目摘要: {summary}")
-        
+            lines.append(f"- **源码根目录:** {source_root}")
+
+        # 虚拟环境
+        virtual_env = context.get("virtual_environment") or scout.get("virtual_environment", "")
+        if virtual_env and virtual_env != "未检测到":
+            lines.append(f"- **虚拟环境:** {virtual_env}")
+
+        # 构建系统
+        build_system = _get("build_system", "")
+        if build_system:
+            lines.append(f"- **构建系统:** {build_system}")
+
+        # 配置文件
+        config_files = _get("config_files", [])
+        if config_files:
+            lines.append(f"- **配置文件:** {len(config_files)} 个")
+
+        # 关键文件
+        key_files = _get("key_files", [])
+        if key_files:
+            lines.append(f"- **关键文件:** {len(key_files)} 个")
+
+        # 测试目录
+        test_directory = _get("test_directory", "")
+        if test_directory:
+            lines.append(f"- **测试目录:** {test_directory}")
+
+        # 模块数量统计
+        nested_modules = context.get("modules", [])
+        scout_modules = scout.get("modules", [])
+        researched_count = sum(1 for m in nested_modules if m.get("success"))
+        total_scout = len(scout_modules) if scout_modules else len(nested_modules)
+        if nested_modules and scout_modules:
+            lines.append(f"- **模块数:** {total_scout}（其中 {researched_count} 个已深度研究）")
+        elif nested_modules:
+            lines.append(f"- **模块数:** {len(nested_modules)}（其中 {researched_count} 个已深度研究）")
+        elif scout_modules:
+            lines.append(f"- **模块数:** {len(scout_modules)}（未深度研究）")
+
+        lines.append("")
+
+        # ── 模块详细报告 ──
+        if nested_modules:
+            for mod in nested_modules:
+                mod_path = mod.get("path", "未知模块")
+                success = mod.get("success", False)
+                report = mod.get("report")
+
+                lines.append(f"### 模块: {mod_path}")
+
+                if not success:
+                    lines.append("（研究失败）")
+                    lines.append("")
+                    continue
+
+                if report is None:
+                    lines.append("（无报告）")
+                    lines.append("")
+                    continue
+
+                if isinstance(report, str):
+                    # 纯文本报告
+                    lines.append(report)
+                    lines.append("")
+                    continue
+
+                if not isinstance(report, dict):
+                    lines.append("")
+                    continue
+
+                # ── dict 格式详细报告 ──
+
+                # 用途
+                purpose = report.get("purpose", "")
+                if purpose:
+                    lines.append(f"**用途:** {purpose}")
+
+                # 核心类
+                key_classes = report.get("key_classes", [])
+                if key_classes:
+                    lines.append("**核心类:**")
+                    for kc in key_classes:
+                        name = kc.get("name", "")
+                        file = kc.get("file", "")
+                        desc = kc.get("description", "")
+                        if file:
+                            lines.append(f"- **`{name}`** (`{file}`) — {desc}")
+                        else:
+                            lines.append(f"- **`{name}`** — {desc}")
+
+                # 核心函数
+                key_functions = report.get("key_functions", [])
+                if key_functions:
+                    lines.append("**核心函数:**")
+                    for kf in key_functions:
+                        name = kf.get("name", "")
+                        file = kf.get("file", "")
+                        desc = kf.get("description", "")
+                        if file:
+                            lines.append(f"- **`{name}`** (`{file}`) — {desc}")
+                        else:
+                            lines.append(f"- **`{name}`** — {desc}")
+
+                # 依赖
+                dependencies = report.get("dependencies", [])
+                if dependencies:
+                    deps_text = ", ".join(dependencies)
+                    lines.append(f"**依赖:** {deps_text}")
+
+                # 设计模式
+                patterns = report.get("patterns", [])
+                if patterns:
+                    lines.append("**设计模式:**")
+                    for p in patterns:
+                        lines.append(f"- {p}")
+
+                # 公开 API
+                public_api = report.get("public_api", [])
+                if public_api:
+                    api_text = ", ".join(str(item) for item in public_api)
+                    if len(api_text) > 300:
+                        api_text = api_text[:300] + "..."
+                    lines.append(f"**公开 API:** {api_text}")
+
+                # 摘要
+                summary = report.get("summary", "")
+                if summary:
+                    lines.append(f"**摘要:** {summary}")
+
+                lines.append("")
+
+        elif scout_modules:
+            # 仅有侦查信息，无深度研究
+            lines.append("### 模块列表（仅侦查）")
+            lines.append("")
+            for sm in scout_modules:
+                path = sm.get("path", "未知")
+                desc = sm.get("description", "")
+                files = sm.get("estimated_files", "?")
+                lines.append(f"- **{path}** — {desc}（约 {files} 个文件）")
+            lines.append("")
+
         return "\n".join(lines)

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import locale
+import subprocess
 import sys
 import uuid
+
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 from typing import Annotated
 
 from src.app.plugin_system.base import BaseTool
@@ -15,6 +18,21 @@ from .base import CodingToolMixin
 from ..services.terminal_environment import build_terminal_launch, get_preferred_terminal_from_config
 
 logger = get_logger("coding_agent.bash")
+
+
+def _hidden_subprocess_kwargs() -> dict[str, object]:
+    """构造 Windows 下隐藏控制台窗口所需的启动参数。"""
+
+    if sys.platform != "win32":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": _CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
 
 
 def _detect_console_encoding() -> str:
@@ -33,6 +51,9 @@ def _detect_console_encoding() -> str:
 
 
 _CONSOLE_ENCODING = _detect_console_encoding()
+# 模块级缓存：假设进程生命周期内终端编码不变。
+# 在极少数场景下（如运行时切换终端）可能过期，但 _execute_command
+# 仍可正确解码，因为 subprocess 输出编码由 OS 终端决定，通常稳定。
 
 
 class ConsoleTool(CodingToolMixin, BaseTool):
@@ -158,7 +179,9 @@ class ConsoleTool(CodingToolMixin, BaseTool):
 
         max_output_lines = int(getattr(bash_config, "max_output_lines", 200) or 200)
         launch = build_terminal_launch(command, preferred_terminal)
-        output_encoding = _CONSOLE_ENCODING
+        # 每次执行时重新检测编码，避免模块加载时的缓存过期
+        # （虽然进程生命周期内终端编码通常不变，但防御性检测成本极低）
+        output_encoding = _detect_console_encoding()
         process = None
         session = self._get_current_session()
         session_mgr = self._get_session_manager() if session else None
@@ -174,6 +197,7 @@ class ConsoleTool(CodingToolMixin, BaseTool):
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.DEVNULL,
                     cwd=work_dir,
+                    **_hidden_subprocess_kwargs(),
                 )
             else:
                 argv, output_encoding = launch
@@ -183,6 +207,7 @@ class ConsoleTool(CodingToolMixin, BaseTool):
                     stderr=asyncio.subprocess.PIPE,
                     stdin=asyncio.subprocess.DEVNULL,
                     cwd=work_dir,
+                    **_hidden_subprocess_kwargs(),
                 )
         except OSError as e:
             return False, f"无法启动命令: {e}"
@@ -271,6 +296,7 @@ class ConsoleTool(CodingToolMixin, BaseTool):
                     str(pid),
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
+                    **_hidden_subprocess_kwargs(),
                 )
                 await asyncio.wait_for(killer.wait(), timeout=3.0)
                 return

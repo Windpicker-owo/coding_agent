@@ -199,7 +199,9 @@ class CodingOrchestrator:
             ],
             "virtual_environment": venv_info,
         }
-        result["scout"]["virtual_environment"] = venv_info
+        # 将 venv_info 也同步到 scout 子字典中（如果存在且为 dict）
+        if "scout" in result and isinstance(result["scout"], dict):
+            result["scout"]["virtual_environment"] = venv_info
 
         return result
 
