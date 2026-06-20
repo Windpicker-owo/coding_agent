@@ -130,15 +130,15 @@ class CodingAgentAdapter(BaseAdapter):
         async def handler(ws: Any) -> None:
             # 新版 websockets.asyncio.server: path 通过 ws.request.path 访问
             ws_path = getattr(getattr(ws, "request", None), "path", None) or getattr(ws, "path", "/")
-            print(f"[DEBUG] WS 握手请求 path={ws_path!r}, expected={path!r}")
+            logger.debug(f"WS 握手请求 path={ws_path!r}, expected={path!r}")
             logger.info(f"WS 握手请求 path={ws_path!r}")
             if ws_path != path:
-                print(f"[DEBUG] WS path 不匹配: expected={path!r} actual={ws_path!r}")
+                logger.debug(f"WS path 不匹配: expected={path!r} actual={ws_path!r}")
                 logger.warning(f"WS path 不匹配: expected={path!r} actual={ws_path!r}")
                 await ws.close(code=4000, reason="Path mismatch")
                 return
             
-            print(f"[DEBUG] Handshake successful, calling _handle_connection")
+            logger.debug(f"Handshake successful, calling _handle_connection")
             await self._handle_connection(ws)
 
         self._ws_server = await ws_serve(
@@ -189,17 +189,18 @@ class CodingAgentAdapter(BaseAdapter):
         msg_type = raw.get("type", "")
         session_mgr = get_session_manager()
 
+        # ── 心跳保活 ──
+        if msg_type == "ping":
+            ws = self._connections.get(conn_id)
+            if ws:
+                await ws.send(json.dumps({"type": "pong", "id": raw.get("id", "")}, ensure_ascii=False))
+            return
+
         # ── 打开项目 ──
         if msg_type == "project.open":
             payload = raw.get("payload", {})
             working_directory = str(Path(payload.get("working_directory", ".")).resolve())
             
-            try:
-                import os
-                os.chdir(working_directory)
-            except Exception as e:
-                logger.error(f"无法切换工作目录到 {working_directory}: {e}")
-
             # 清理该连接关联的所有旧会话（切换项目，全部重置）
             for sid in session_mgr.get_session_ids_by_conn(conn_id):
                 await session_mgr.destroy_session(sid)
@@ -296,11 +297,6 @@ class CodingAgentAdapter(BaseAdapter):
         if msg_type == "session.init":
             payload = raw.get("payload", {})
             working_directory = str(Path(payload.get("working_directory", ".")).resolve())
-            
-            try:
-                os.chdir(working_directory)
-            except Exception as e:
-                pass
 
             session_id = payload.get("session_id", "")
             solo_mode = payload.get("solo_mode", False)
