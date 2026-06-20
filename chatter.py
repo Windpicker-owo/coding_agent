@@ -1207,6 +1207,9 @@ class CodingAgentChatter(BaseChatter):
                     response.reasoning_content,
                 )
 
+            # 推送上下文用量到前端（工具调用循环中的每一轮 LLM 请求都需要更新）
+            await self._push_context_usage(session_id, response)
+
             logger.debug(
                 f"工具后续响应: round={round_num}, chunks={chunk_count}, "
                 f"tool_calls={len(response.call_list) if response.call_list else 0}, "
